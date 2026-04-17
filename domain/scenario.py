@@ -111,15 +111,17 @@ def apply_action(state: ScenarioState, vehicle_id: str, action: Action) -> str:
 
     elif action == Action.CHANGE_LEFT:
         current_idx = _lane_index(v.position)
-        if current_idx > 0:
+        if current_idx > 0:                          # valid lane AND not leftmost
             v.position = LANE_ORDER[current_idx - 1]
-        event = f"Vehicle {v.id} changes to the left lane."
+            event = f"Vehicle {v.id} changes to the left lane."
+        # else: at edge or non-lane position — no state change, no event
 
     elif action == Action.CHANGE_RIGHT:
         current_idx = _lane_index(v.position)
-        if current_idx < len(LANE_ORDER) - 1:
+        if 0 <= current_idx < len(LANE_ORDER) - 1:  # valid lane AND not rightmost
             v.position = LANE_ORDER[current_idx + 1]
-        event = f"Vehicle {v.id} changes to the right lane."
+            event = f"Vehicle {v.id} changes to the right lane."
+        # else: at edge or non-lane position — no state change, no event
 
     elif action == Action.ENTER_ROUNDABOUT:
         v.inside_intersection = True
@@ -131,17 +133,18 @@ def apply_action(state: ScenarioState, vehicle_id: str, action: Action) -> str:
         v.position = f"{v.direction.value}_exit"
         event = f"Vehicle {v.id} exits the roundabout."
 
-    state.event_log.append(event)
-    state.step += 1
+    if event:                    # only log and advance step if action had an effect
+        state.event_log.append(event)
+        state.step += 1
     return event
 
 
 def _lane_index(position: str) -> int:
-    """Returns index of lane in LEFT-CENTER-RIGHT order, defaults to center."""
+    """Returns index of lane in LEFT-CENTER-RIGHT order, or -1 if not a lane."""
     try:
         return LANE_ORDER.index(position)
     except ValueError:
-        return 1  # default to center if position is not a lane
+        return -1  # sentinel: position is not a lane (consistent with task1_position.py)
 
 
 def _rotate_direction(direction: Direction, turn: str) -> Direction:

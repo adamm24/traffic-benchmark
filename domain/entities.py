@@ -51,9 +51,11 @@ class Vehicle:
     stopped: bool = False
  
     def describe(self) -> str:
-        base = f"Vehicle {self.id} is in the {self.position}"
-        if self.direction:
-            base += f", approaching from the {self.direction.value}"
+        # NOTE: prefer domain.render.describe_vehicle() for prompt generation —
+        # it uses POSITION_LABELS for clean human-readable labels.
+        # This method is kept only for quick debugging.
+        pos_label = self.position.replace("_", " ")
+        base = f"Vehicle {self.id} is in {pos_label}"
         if self.intent:
             base += f", intending to {self.intent.value}"
         return base + "."

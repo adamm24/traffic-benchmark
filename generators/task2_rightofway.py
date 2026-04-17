@@ -36,7 +36,9 @@ from domain.scenario import (
 from domain.rules import (
     right_of_way, right_of_way_intersection, right_of_way_roundabout,
 )
-from domain.render import describe_scenario, render_prompt
+from domain.render import describe_scenario
+# render_prompt intentionally not imported: Task 2 has no event sequence,
+# so the prompt is assembled inline without the events block.
 
 # ── Constants ───────────────────────────────────────────────────────────────
 

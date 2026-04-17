@@ -459,5 +459,3 @@ Environment distribution:
 ```
 
 ---
-
-*Prossimo passo: `generators/task2_rightofway.py`*

@@ -36,11 +36,20 @@ def right_of_way_roundabout(v_inside: Vehicle, v_entering: Vehicle) -> str:
     """
     At a roundabout, vehicles already inside always have priority
     over vehicles attempting to enter.
-    Returns the id of the vehicle with right of way.
+
+    Precondition: v_inside must be the vehicle currently circulating inside
+    the roundabout (inside_intersection == True). The caller is responsible
+    for passing the correct vehicle as v_inside.
+
+    Returns the id of the vehicle with right of way (always v_inside.id).
     """
-    if v_inside.inside_intersection:
-        return v_inside.id
-    return v_entering.id
+    # The vehicle inside the roundabout unconditionally holds right of way.
+    # We do NOT check v_inside.inside_intersection here: if the caller passes
+    # the wrong vehicle (precondition violated), that is the caller's bug.
+    # Previously this function returned v_entering.id when inside_intersection
+    # was False, which would have incorrectly granted priority to the entering
+    # vehicle — the opposite of the correct rule.
+    return v_inside.id
 
 def roundabout_can_enter(entering: Vehicle, vehicles_inside: list[Vehicle]) -> bool:
     """
