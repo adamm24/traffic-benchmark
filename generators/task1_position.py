@@ -46,9 +46,10 @@ MAX_RETRIES  = 50           # per-example retry budget
 TASK_ENVS = [Environment.MULTI_LANE, Environment.INTERSECTION]
 
 # Actions valid per environment (Task 1 — position only, no roundabout)
+# NOTE: MOVE_FORWARD excluded from MULTI_LANE because it doesn't change
+#       the lane position and would be a no-op for position tracking.
 ACTIONS_BY_ENV = {
     Environment.MULTI_LANE: [
-        Action.MOVE_FORWARD,
         Action.CHANGE_LEFT,
         Action.CHANGE_RIGHT,
     ],
@@ -95,18 +96,24 @@ def safe_apply_action(
             return None                         # already rightmost
 
         # Compute destination lane and check for collisions
-        if action in (Action.CHANGE_LEFT, Action.CHANGE_RIGHT):
-            dest_idx = idx - 1 if action == Action.CHANGE_LEFT else idx + 1
-            dest_lane = LANE_ORDER[dest_idx]
-            for other in state.vehicles:
-                if other.id != vehicle_id and other.position == dest_lane:
-                    return None                 # lane occupied
+        # NOTE: collision check removed — in a discrete multi-lane model,
+        # vehicles at the same lane are at different points along the road,
+        # so sharing a lane is physically plausible.  The old check made
+        # it impossible to generate any valid multi-lane sequence when all
+        # 3 lanes were occupied (deadlock).
 
-    # ── Intersection: block turn if not inside yet ──────────────────────
+    # ── Intersection guards ────────────────────────────────────────────
     if state.environment == Environment.INTERSECTION:
+        # Block turn if not inside yet
         if action in (Action.TURN_LEFT, Action.TURN_RIGHT):
             if not v.inside_intersection:
                 return None                     # must MOVE_FORWARD first
+        # Block MOVE_FORWARD if already inside (no-op → wastes a step)
+        if action == Action.MOVE_FORWARD and v.inside_intersection:
+            return None
+        # Block MOVE_FORWARD from an exit position (prevents re-entry loop)
+        if action == Action.MOVE_FORWARD and v.position.endswith("_exit"):
+            return None
 
     return apply_action(state, vehicle_id, action)
 
@@ -131,14 +138,23 @@ def generate_sequence(
     valid_actions = ACTIONS_BY_ENV[env]
     start_pos = state.get_vehicle(queried_vid).position
 
+    # For intersection, queried vehicle needs ≥2 actions to enter + turn.
+    # For multi_lane, 1 action suffices (each lane change moves position).
+    min_queried_moves = 2 if env == Environment.INTERSECTION else 1
+
     for _ in range(MAX_RETRIES):
         trial_state = copy.deepcopy(state)
         events: list[str] = []
-        queried_moved = False
+        queried_move_count = 0
 
         for step_idx in range(n_steps):
-            # Last step: force the queried vehicle if it hasn't moved yet
-            if step_idx == n_steps - 1 and not queried_moved:
+            remaining = n_steps - step_idx
+            queried_deficit = min_queried_moves - queried_move_count
+
+            # Reserve enough remaining steps for the queried vehicle
+            if queried_deficit >= remaining:
+                vid = queried_vid
+            elif step_idx == n_steps - 1 and queried_move_count == 0:
                 vid = queried_vid
             else:
                 vid = random.choice(vehicle_ids)
@@ -154,7 +170,7 @@ def generate_sequence(
                     trial_state = snapshot
                     events.append(result)
                     if vid == queried_vid:
-                        queried_moved = True
+                        queried_move_count += 1
                     applied = True
                     break
 
@@ -163,6 +179,10 @@ def generate_sequence(
 
         if len(events) != n_steps:
             continue                            # incomplete sequence
+
+        # Queried vehicle must have moved at least min_queried_moves times
+        if queried_move_count < min_queried_moves:
+            continue
 
         # Final position must differ from starting position
         final_pos = trial_state.get_vehicle(queried_vid).position
