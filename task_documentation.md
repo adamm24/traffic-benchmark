@@ -17,6 +17,7 @@ Questo documento raccoglie, per ogni task del benchmark, i vincoli progettuali (
   - [1.5 Metriche prima/dopo i fix](#15-metriche-primadopo-i-fix)
   - [1.6 Validazione finale](#16-validazione-finale)
   - [1.7 Note e osservazioni](#17-note-e-osservazioni)
+  - [1.8 Problemi residui noti (versione corrente)](#18-problemi-residui-noti-versione-corrente)
 
 ---
 
@@ -339,6 +340,76 @@ L'azione `STOP` non e inclusa nel pool di azioni del Task 1 perche non modifica 
 ### Scalabilita
 
 Il generatore e configurato per produrre 100 esempi (`N_EXAMPLES = 100`). Per il Core Dataset finale il valore va portato a 300. Il key_schedule richiede che `N_EXAMPLES` sia un multiplo di 5 per garantire il bilanciamento perfetto delle risposte.
+
+---
+
+## 1.8 Problemi residui noti (versione corrente)
+
+I bug strutturali e i problemi di qualita documentati nelle sezioni 1.4–1.6 sono stati risolti. Tuttavia, l'analisi del dataset generato dalla versione corrente del generatore evidenzia sei problemi residui che riducono la qualita complessiva degli esempi. Nessuno di questi rende il dataset formalmente scorretto (le risposte sono verificate via replay), ma ciascuno rappresenta una debolezza che un futuro intervento dovrebbe risolvere.
+
+Ogni problema e classificato come: **qualita dati**, **costruzione distrattori**, **validazione/audit**, oppure **naturalezza/ripetitivita**.
+
+### 1.8.1 Distrattori cross-environment ancora presenti — COSTRUZIONE DISTRATTORI
+
+**Stato:** problema dominante della versione corrente.
+
+Il generatore produce regolarmente opzioni di risposta che appartengono a un ambiente diverso da quello dello scenario. Questo avviene in entrambe le direzioni:
+
+- In esempi `intersection`, compaiono etichette proprie di `multi_lane_road` come "the right lane", "the center lane", "the left lane", oppure di `roundabout` come "the roundabout lane".
+- In esempi `multi_lane_road`, compaiono etichette proprie di `intersection` come "the western exit", "the northern exit", "inside the intersection", o "the southern approach".
+
+Questo accade perche `build_choices()` assegna a `highly_false_1` un'etichetta estratta esplicitamente da `cross_env_labels(env)` — cioe un pool di etichette valide in altri ambienti ma non in quello corrente. Quando anche `highly_false_2` non trova etichette same-environment non visitate, il fallback produce un secondo distrattore cross-environment.
+
+Il risultato e che almeno una (e talvolta due) delle cinque opzioni di risposta e eliminabile senza alcun ragionamento sulla sequenza di eventi: basta sapere in quale ambiente ci si trova. Un distractor con "the right lane" in uno scenario di intersection non richiede al modello alcuna capacita di state tracking per essere scartato.
+
+### 1.8.2 L'audit rileva il problema ma la generazione lo permette — VALIDAZIONE/AUDIT
+
+Il campo `audit.rationale_by_letter` presente in ogni esempio generato gia etichetta correttamente i distrattori cross-environment con razionali come:
+
+- `"cross-environment label (not valid for intersection)"`
+- `"cross-environment label (not valid for multi_lane_road)"`
+- `"cross-environment label (multi_lane_road has no unvisited same-env label available)"`
+
+Questo dimostra che la pipeline di validazione riconosce la natura del problema. Tuttavia, il riconoscimento non produce un rigetto: l'esempio viene accettato comunque e il distrattore cross-environment finisce nel dataset finale. L'audit funge da annotazione passiva piuttosto che da filtro attivo.
+
+### 1.8.3 L'invariante `all_labels_in_vocabulary` e troppo debole — VALIDAZIONE/AUDIT
+
+Il campo `audit.invariants.all_labels_in_vocabulary` verifica che ogni testo delle opzioni appartenga al vocabolario controllato (modulo `domain.vocabulary`). Tuttavia, la condizione implementata e:
+
+```
+is_valid_label(choices[L], env) or choices[L] in cross_env_labels(env)
+```
+
+Questa condizione accetta come valide sia le etichette dell'ambiente corrente sia quelle di ambienti diversi, purche esistano nel vocabolario globale. Di conseguenza, l'invariante risulta sempre `true` e non distingue tra un set di opzioni interamente same-environment e uno contaminato da etichette cross-environment. Un invariante piu restrittivo, che verifichi l'appartenenza esclusiva all'ambiente corrente, renderebbe il problema immediatamente visibile e bloccante.
+
+### 1.8.4 Criteri di selezione dei distrattori incoerenti — COSTRUZIONE DISTRATTORI
+
+La logica di `build_choices()` utilizza due criteri semantici distinti per selezionare i distrattori, senza rendere esplicita la differenza:
+
+- Per `near_true_2`, il criterio e "posizione finale di un altro veicolo dello scenario" (con fallback a "same-environment label, not currently held by any vehicle"). Il razionale mescola il concetto di "posizione occupata al termine della sequenza" con "posizione non attualmente detenuta".
+- Per `highly_false_2`, il criterio e "same-environment label not visited by any vehicle" — cioe una posizione che nessun veicolo ha mai attraversato durante tutta la sequenza.
+
+Le due nozioni ("not currently held" vs. "not visited by any vehicle") non sono equivalenti: una posizione puo essere stata visitata da un veicolo durante la sequenza ma non essere la sua posizione finale. Il generatore oscilla tra i due criteri in base alla disponibilita del pool, il che rende la classificazione `near_true`/`highly_false` meno prevedibile e piu difficile da interpretare in fase di analisi del dataset.
+
+### 1.8.5 Pattern di azione ripetitivi e meccanici — NATURALEZZA/RIPETITIVITA
+
+La funzione `generate_sequence()` non applica vincoli di qualita semantica sulla sequenza di azioni. In particolare:
+
+- Coppie consecutive identiche come `CHANGE_LEFT, CHANGE_LEFT` o `CHANGE_RIGHT, CHANGE_RIGHT` sono ammesse. In un sistema a tre corsie queste sequenze non sono sempre invalide (es. da `right_lane` a `center_lane` a `left_lane`), ma quando compaiono frequentemente rendono il dataset ripetitivo e meccanico.
+- Non c'e un filtro anti-zigzag: un veicolo puo oscillare tra due posizioni (es. `center_lane → left_lane → center_lane`) senza che la sequenza venga scartata.
+- Non c'e un limite al numero di azioni consecutive eseguite dallo stesso veicolo: un singolo veicolo puo compiere tutte le azioni della sequenza (a parte il vincolo `min_queried_moves`).
+
+Il risultato e che molte sequenze, pur essendo formalmente valide, presentano pattern poco naturali che riducono la varieta percepita del dataset e possono introdurre bias sfruttabili da un modello (es. associare "due CHANGE_LEFT consecutivi" con "posizione finale = left_lane").
+
+### 1.8.6 Qualita complessiva del set di distrattori insufficiente in alcuni esempi — QUALITA DATI
+
+Anche quando la risposta corretta e verificata via replay, il set complessivo delle cinque opzioni non e sempre ben costruito. Le debolezze osservate includono:
+
+- Uno o piu distrattori sono ovviamente invalidi per l'ambiente dello scenario (vedi 1.8.1), rendendo la domanda effettivamente a 3 o 4 opzioni anziche 5.
+- I distrattori sono troppo prevedibili: la posizione iniziale del veicolo interrogato compare quasi sempre come `near_true_1`, il che puo diventare un pattern riconoscibile.
+- Le categorie di razionale (`near_true`, `highly_false`) non sono applicate in modo uniforme: la stessa posizione potrebbe essere classificata `near_true` in un esempio e `highly_false` in un altro, a seconda del percorso di fallback nella logica di `build_choices()`.
+
+Queste debolezze non compromettono la correttezza formale del dataset, ma riducono la sua capacita discriminativa: un modello potrebbe ottenere un punteggio elevato sfruttando euristiche superficiali (es. eliminare le opzioni cross-environment) piuttosto che eseguire un autentico state tracking.
 
 ---
 
