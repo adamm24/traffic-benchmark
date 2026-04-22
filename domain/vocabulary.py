@@ -70,6 +70,40 @@ _POSITIONS_BY_ENV: dict[Environment, tuple[str, ...]] = {
 }
 
 
+# ── Dedicated highly_false pool (same-environment, never reachable) ──────────
+#
+# These are real road-context concepts that a driver would recognise as
+# same-domain labels but that the simulator never produces as a vehicle
+# position. They exist so the generator can fill the 5-slot MCQ for
+# environments whose reachable position set is too small (multi_lane_road
+# only has 3 lanes, so same-environment distractors would exhaust after
+# the correct answer + near_true_1).
+#
+# Rules:
+#   • A highly_false label is NEVER a correct answer.
+#   • A highly_false label belongs to the same driving domain as the env
+#     (lane-like for multi_lane, intersection-geometry-like for
+#     intersection if ever needed) so it is not trivially eliminable by
+#     "environment keyword matching".
+#   • Intersection already has 9 reachable labels → empty pool.
+#   • Roundabout is excluded from Task 1 → empty pool.
+#
+# If a future task requires a same-env highly_false for intersection or
+# roundabout, extend this table — do NOT fall back to cross-environment
+# labels in generator code.
+
+HIGHLY_FALSE_LABELS_BY_ENV: dict[Environment, tuple[str, ...]] = {
+    Environment.INTERSECTION: (),
+    Environment.MULTI_LANE: (
+        "the road shoulder",
+        "the emergency lane",
+        "the median strip",
+        "the oncoming lane",
+    ),
+    Environment.ROUNDABOUT: (),
+}
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 def label_of(position: str) -> str:
@@ -119,3 +153,26 @@ def cross_env_labels(env: Environment) -> tuple[str, ...]:
 def is_valid_label(label: str, env: Environment) -> bool:
     """True iff `label` is a human-readable label legitimate for `env`."""
     return label in labels_for_env(env)
+
+
+def highly_false_labels_for_env(env: Environment) -> tuple[str, ...]:
+    """
+    Returns the dedicated highly_false label pool for `env`. These are
+    same-domain, same-environment distractor labels that the simulator
+    never produces as a real vehicle position. They are part of the
+    controlled vocabulary but never appear as correct answers.
+
+    See the module-level comment on HIGHLY_FALSE_LABELS_BY_ENV for the
+    rules governing this pool.
+    """
+    return HIGHLY_FALSE_LABELS_BY_ENV.get(env, ())
+
+
+def is_env_consistent_label(label: str, env: Environment) -> bool:
+    """
+    True iff `label` is legitimate for `env` as an MCQ option: either a
+    real reachable position label for `env`, or one of the dedicated
+    highly_false pool labels for `env`. Cross-environment labels return
+    False — the generator MUST NOT use them as distractors.
+    """
+    return label in labels_for_env(env) or label in highly_false_labels_for_env(env)
