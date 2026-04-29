@@ -1,7 +1,6 @@
 from .entities import ScenarioState, Vehicle, Environment
 
 
-# ── Position descriptions ────────────────────────────────────────────────────
 
 POSITION_LABELS = {
     "left_lane":            "the left lane",
@@ -23,22 +22,15 @@ def _pos(position: str) -> str:
     return POSITION_LABELS.get(position, position.replace("_", " "))
 
 
-# ── Vehicle description ───────────────────────────────────────────────────────
 
 def describe_vehicle(v: Vehicle) -> str:
-    """
-    Returns a natural language description of a vehicle's initial state.
-    Examples:
-      - "Vehicle A is in the left lane."
-      - "Vehicle B is at the northern approach, intending to turn left."
-    """
+    """Natural-language description of a vehicle's initial state."""
     base = f"Vehicle {v.id} is in {_pos(v.position)}"
     if v.intent:
         base += f", intending to {v.intent.value}"
     return base + "."
 
 
-# ── Scenario description ──────────────────────────────────────────────────────
 
 ENV_LABELS = {
     "intersection":    "an intersection",
@@ -47,14 +39,7 @@ ENV_LABELS = {
 }
 
 def describe_scenario(state: ScenarioState) -> str:
-    """
-    Returns a full natural language description of the initial scenario.
-    Example output:
-        Three vehicles are at an intersection.
-        Vehicle A is in the northern approach, intending to go straight.
-        Vehicle B is in the eastern approach, intending to turn left.
-        Vehicle C is in the southern approach.
-    """
+    """Natural-language description of the initial scenario."""
     count_word = {2: "Two", 3: "Three", 4: "Four", 5: "Five"}.get(
         len(state.vehicles), str(len(state.vehicles))
     )
@@ -64,41 +49,21 @@ def describe_scenario(state: ScenarioState) -> str:
     return "\n".join(lines)
 
 
-# ── Event sequence description ────────────────────────────────────────────────
 
 def describe_events(events: list[str]) -> str:
-    """
-    Formats a list of event strings as a numbered sequence.
-    Example output:
-        Sequence of events:
-        1. Vehicle A moves forward.
-        2. Vehicle B changes to the left lane.
-        3. Vehicle C stops.
-    """
+    """Format events as a numbered sequence."""
     if not events:
         return "No events occurred."
     numbered = "\n".join(f"{i+1}. {e}" for i, e in enumerate(events))
     return f"Sequence of events:\n{numbered}"
 
 
-# ── Full prompt renderer ──────────────────────────────────────────────────────
 
 def render_prompt(scenario_text: str,
                   events: list[str],
                   question: str,
                   choices: dict[str, str]) -> str:
-    """
-    Assembles the full multiple-choice prompt ready for LLM evaluation.
-
-    Args:
-        scenario_text: output of describe_scenario()
-        events:        list of event strings
-        question:      the question string
-        choices:       dict mapping "A".."E" to answer text
-
-    Returns:
-        A single formatted string.
-    """
+    """Assemble the multiple-choice prompt."""
     parts = [
         scenario_text,
         "",

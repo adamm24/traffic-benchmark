@@ -12,7 +12,7 @@
 - [2. Struttura del modulo `domain/`](#2-struttura-del-modulo-domain)
 - [3. Bug e limitazioni — Task 1 (Position Tracking)](#3-bug-e-limitazioni--task-1-position-tracking)
 - [4. Bug e limitazioni — Task 2 (Right-of-Way Reasoning)](#4-bug-e-limitazioni--task-2-right-of-way-reasoning)
-- [5. Fix applicati al codice](#5-fix-applicati-al-codice)
+- [5. Correzioni applicate al codice](#5-fix-applicati-al-codice)
 - [6. Tavola di riepilogo](#6-tavola-di-riepilogo)
 - [7. Note progettuali e decisioni di design](#7-note-progettuali-e-decisioni-di-design)
 
@@ -113,7 +113,7 @@ Questa sezione documenta tutti i problemi identificati nel generatore `generator
 
 `apply_action()` in `scenario.py` non verifica che il veicolo sia `inside_intersection` prima di eseguire `TURN_LEFT` o `TURN_RIGHT`. Se chiamato direttamente (bypassando `safe_apply_action`), un veicolo in approccio potrebbe svoltare senza essere entrato.
 
-**Fix applicato:** Il guard è in `safe_apply_action()` del generatore:
+**Correzione applicata:** Il guard è in `safe_apply_action()` del generatore:
 ```python
 if action in (Action.TURN_LEFT, Action.TURN_RIGHT):
     if not v.inside_intersection:
@@ -149,9 +149,9 @@ Questi stati derivano da combinazioni dei campi `position`, `inside_intersection
 **Gravità:** Medio  
 **Stato:** PARZIALE
 
-Una volta che un veicolo raggiunge una posizione `{dir}_exit`, non è formalmente definito cosa succede. Il veicolo ha lasciato l'incrocio e non dovrebbe interagire più con gli altri. Tuttavia, il bug "loop di ri-entrata" (descritto in `task_documentation.md`, §1.4.4) mostrava che `MOVE_FORWARD` poteva riportare il veicolo dentro l'incrocio da un'uscita.
+Una volta che un veicolo raggiunge una posizione `{dir}_exit`, non è formalmente definito cosa succede. Il veicolo ha lasciato l'incrocio e non dovrebbe interagire più con gli altri. Tuttavia, il bug "loop di ri-entrata" (descritto in `documentation/task_documentation.md`, §1.4.4) mostrava che `MOVE_FORWARD` poteva riportare il veicolo dentro l'incrocio da un'uscita.
 
-**Fix applicato in `safe_apply_action()`:**
+**Correzione applicata in `safe_apply_action()`:**
 ```python
 if action == Action.MOVE_FORWARD and v.position.endswith("_exit"):
     return None
@@ -165,7 +165,7 @@ if action == Action.MOVE_FORWARD and v.position.endswith("_exit"):
 **Gravità:** Medio  
 **Stato:** NOTO (design consapevole)
 
-Nel modello discreto, due veicoli possono occupare la stessa corsia contemporaneamente. Il collision check originale è stato rimosso (Bug 1 in `task_documentation.md`) perché causava deadlock totale: con 3 veicoli su 3 corsie, nessun cambio corsia era possibile.
+Nel modello discreto, due veicoli possono occupare la stessa corsia contemporaneamente. Il collision check originale è stato rimosso (Bug 1 in `documentation/task_documentation.md`) perché causava deadlock totale: con 3 veicoli su 3 corsie, nessun cambio corsia era possibile.
 
 **Decisione progettuale:** Nel modello discreto, due veicoli sulla stessa corsia sono implicitamente a posizioni diverse lungo la strada (diversi "segmenti"). Il position tracking riguarda la corsia (dimensione laterale), non la posizione longitudinale. La condivisione della corsia è fisicamente plausibile e non ambigua per il task.
 
@@ -190,7 +190,7 @@ Strettamente correlato a T1-B05. Non esiste una regola che dica "non puoi entrar
 - `TURN_LEFT` su un veicolo in approccio non è bloccato dal domain
 - `MOVE_FORWARD` su `multi_lane` genera un evento senza cambiare lo stato
 
-**Fix applicato (questo ciclo di revisione):** `apply_action()` ora genera l'evento CHANGE_LEFT/RIGHT solo se la posizione cambia effettivamente (vedi §5). I guard semantici più complessi rimangono in `safe_apply_action()`.
+**Correzione applicata (questo ciclo di revisione):** `apply_action()` ora genera l'evento CHANGE_LEFT/RIGHT solo se la posizione cambia effettivamente (vedi §5). I guard semantici più complessi rimangono in `safe_apply_action()`.
 
 ---
 
@@ -249,9 +249,9 @@ Le label `"off the road"` e `"unknown location"` non sono posizioni del dominio,
 **Gravità:** Alto  
 **Stato:** CORRETTO
 
-Prima dei fix documentati in `task_documentation.md` (§1.4.2 e §1.4.3), `MOVE_FORWARD` poteva essere applicato più volte sullo stesso veicolo già dentro l'incrocio, generando eventi semanticamente vuoti ("Vehicle A moves forward." quando A era già `inside_intersection`).
+Prima dei fix documentati in `documentation/task_documentation.md` (§1.4.2 e §1.4.3), `MOVE_FORWARD` poteva essere applicato più volte sullo stesso veicolo già dentro l'incrocio, generando eventi semanticamente vuoti ("Vehicle A moves forward." quando A era già `inside_intersection`).
 
-**Fix applicato:**
+**Correzione applicata:**
 ```python
 if action == Action.MOVE_FORWARD and v.inside_intersection:
     return None
@@ -352,7 +352,7 @@ Questi due veicoli hanno un conflitto reale, ma `right_of_way_intersection(A, B)
 
 Come descritto in T2-B01, due veicoli che arrivano da direzioni opposte sono trattati come "nessun conflitto" (`right_of_way_intersection` restituisce `None`). Il generatore evita questo caso con `_has_lateral_conflict()`, ma la funzione di dominio stessa non lo gestisce esplicitamente.
 
-**Fix parziale:** `_build_intersection_with_conflict()` usa `_has_lateral_conflict()` per garantire che solo coppie con conflitto laterale vengano selezionate. Gli scenari con veicoli opposti vengono esclusi silenziosamente.
+**Correzione parziale:** `_build_intersection_with_conflict()` usa `_has_lateral_conflict()` per garantire che solo coppie con conflitto laterale vengano selezionate. Gli scenari con veicoli opposti vengono esclusi silenziosamente.
 
 ---
 
@@ -492,7 +492,7 @@ Non esiste uno script che verifichi automaticamente, per ogni esempio di Task 2:
 - Che la risposta corretta sia effettivamente derivabile dalla logica implementata
 - Che il veicolo indicato come `priority_vehicle` nei metadata corrisponda alla risposta corretta nel JSON
 
-Questa validazione esiste implicitamente (il generatore costruisce la risposta dallo stesso calcolo usato per il ground truth) ma non c'è un replay indipendente come quello fatto per Task 1 (§1.6 di `task_documentation.md`).
+Questa validazione esiste implicitamente (il generatore costruisce la risposta dallo stesso calcolo usato per il ground truth) ma non c'è un replay indipendente come quello fatto per Task 1 (§1.6 di `documentation/task_documentation.md`).
 
 ---
 
@@ -502,7 +502,7 @@ Questa validazione esiste implicitamente (il generatore costruisce la risposta d
 
 **Problema originale:** La funzione controllava `if v_inside.inside_intersection:` prima di ritornare `v_inside.id`. Se la precondizione veniva violata (veicolo non effettivamente dentro la rotatoria), la funzione restituiva `v_entering.id` — esattamente l'opposto della regola corretta.
 
-**Fix applicato:**
+**Correzione applicata:**
 ```python
 # Prima (ERRATO):
 def right_of_way_roundabout(v_inside, v_entering):
@@ -517,11 +517,11 @@ def right_of_way_roundabout(v_inside, v_entering):
 
 ---
 
-## 5. Fix applicati al codice
+## 5. Correzioni applicate al codice
 
 Questo ciclo di revisione ha prodotto le seguenti modifiche al codice sorgente:
 
-### Fix 1 — `domain/scenario.py`: `_lane_index` ritornava valore errato per posizioni non-corsia
+### Correzione 1 — `domain/scenario.py`: `_lane_index` ritornava valore errato per posizioni non-corsia
 
 **File:** `domain/scenario.py`  
 **Funzione:** `_lane_index()`
@@ -549,7 +549,7 @@ def _lane_index(position: str) -> int:
 
 ---
 
-### Fix 2 — `domain/scenario.py`: `apply_action` generava evento CHANGE_LEFT/RIGHT anche senza cambiare stato
+### Correzione 2 — `domain/scenario.py`: `apply_action` generava evento CHANGE_LEFT/RIGHT anche senza cambiare stato
 
 **File:** `domain/scenario.py`  
 **Funzione:** `apply_action()`
@@ -591,7 +591,7 @@ return event
 
 ---
 
-### Fix 3 — `domain/rules.py`: `right_of_way_roundabout` aveva logica pericolosa
+### Correzione 3 — `domain/rules.py`: `right_of_way_roundabout` aveva logica pericolosa
 
 **File:** `domain/rules.py`  
 **Funzione:** `right_of_way_roundabout()`
@@ -600,7 +600,7 @@ Vedi T2-B15 sopra. La condizione `if v_inside.inside_intersection:` è stata rim
 
 ---
 
-### Fix 4 — `generators/task2_rightofway.py`: import inutilizzato
+### Correzione 4 — `generators/task2_rightofway.py`: import inutilizzato
 
 **File:** `generators/task2_rightofway.py`
 
@@ -620,7 +620,7 @@ from domain.render import describe_scenario
 
 ---
 
-### Fix 5 — `domain/entities.py`: `Vehicle.describe()` usava la stringa grezza della posizione
+### Correzione 5 — `domain/entities.py`: `Vehicle.describe()` usava la stringa grezza della posizione
 
 **File:** `domain/entities.py`  
 **Metodo:** `Vehicle.describe()`
@@ -639,7 +639,6 @@ def describe(self) -> str:
 **Dopo:**
 ```python
 def describe(self) -> str:
-    # NOTE: prefer domain.render.describe_vehicle() for prompt generation.
     pos_label = self.position.replace("_", " ")
     base = f"Vehicle {self.id} is in {pos_label}"
     if self.intent:
@@ -663,7 +662,7 @@ def describe(self) -> str:
 | T1-B04 | Stato terminale `_exit` non formalizzato | Medio | PARZIALE |
 | T1-B05 | Collisioni multi-lane non modellate | Medio | NOTO (design) |
 | T1-B06 | Lane change senza vincoli di occupazione | Basso | NOTO (design) |
-| T1-B07 | Assenza di validazione nel domain layer | Medio | PARZIALE (Fix 2) |
+| T1-B07 | Assenza di validazione nel domain layer | Medio | PARZIALE (Correzione 2) |
 | T1-B08 | MOVE_FORWARD troppo generico | Medio | NOTO (design) |
 | T1-B09 | Roundabout e intersection modellate diversamente | Medio | NOTO (design) |
 | T1-B10 | Label fallback hardcoded (`"off the road"`) | Basso | NOTO |
@@ -690,17 +689,17 @@ def describe(self) -> str:
 | T2-B12 | Distrattori talvolta ambigui o troppo forti | Medio | NOTO |
 | T2-B13 | Dipendenza implicita da convenzioni del traffico | Medio | NOTO (design) |
 | T2-B14 | Assenza di validazione automatica delle label Task 2 | Medio | NOTO |
-| T2-B15 | `right_of_way_roundabout` con condizione errata | Alto | **CORRETTO** (Fix 3) |
+| T2-B15 | `right_of_way_roundabout` con condizione errata | Alto | **CORRETTO** (Correzione 3) |
 
-### Fix al domain layer (indipendenti dalla task)
+### Correzione al domain layer (indipendenti dalla task)
 
-| Fix | File | Descrizione |
+| Correzione | File | Descrizione |
 |---|---|---|
-| Fix 1 | `domain/scenario.py` | `_lane_index` ritornava 1 per posizioni non-corsia → teleport silenzioso |
-| Fix 2 | `domain/scenario.py` | `apply_action` CHANGE_LEFT/RIGHT generava evento anche senza muovere il veicolo |
-| Fix 3 | `domain/rules.py` | `right_of_way_roundabout` logica errata con condizione ridondante/pericolosa |
-| Fix 4 | `generators/task2_rightofway.py` | Import inutilizzato `render_prompt` rimosso |
-| Fix 5 | `domain/entities.py` | `Vehicle.describe()` usava posizione raw con underscore |
+| Correzione 1 | `domain/scenario.py` | `_lane_index` ritornava 1 per posizioni non-corsia → teleport silenzioso |
+| Correzione 2 | `domain/scenario.py` | `apply_action` CHANGE_LEFT/RIGHT generava evento anche senza muovere il veicolo |
+| Correzione 3 | `domain/rules.py` | `right_of_way_roundabout` logica errata con condizione ridondante/pericolosa |
+| Correzione 4 | `generators/task2_rightofway.py` | Import inutilizzato `render_prompt` rimosso |
+| Correzione 5 | `domain/entities.py` | `Vehicle.describe()` usava posizione raw con underscore |
 
 ---
 

@@ -1,40 +1,19 @@
-"""
-Right-of-way and violation rules.
-
-This module hosts the canonical rule functions used by Task 2 generators
-and by the independent Task 2 validator. It has two public entry points:
-
-  • right_of_way(v1, v2, env)
-        Dispatcher. Returns the id of the vehicle with priority, or None
-        for "no conflict". Raises UnsupportedScenarioError for scenarios
-        the ruleset cannot answer (e.g. a roundabout with no vehicle
-        inside — previously silently misrouted to intersection logic,
-        closes T2-B10).
-
-  • right_of_way_intersection_with_intent(v1, v2)
-        Intent-aware intersection rule. Uses the 4-cell trajectory model
-        from domain.trajectory to detect actual path conflicts and
-        applies:
-          1. left-turn-yields-to-oncoming, then
-          2. priority-to-the-right
-        Callers that have declared intent for both vehicles should prefer
-        this over right_of_way_intersection.
-
-The old direction-only helpers (right_of_way_intersection,
-right_of_way_roundabout) are preserved for backward compatibility with
-callers that do not use intent (Task 1 and legacy code).
-"""
+"""Right-of-way and violation rules."""
 from __future__ import annotations
 
 from typing import Optional
 
 from .entities import (
+    Action,
     Direction,
     Environment,
     IntentDirection,
+    Lane,
+    ScenarioState,
     UnsupportedScenarioError,
     Vehicle,
 )
+from .fsm import is_transition_applicable
 from .trajectory import (
     both_have_intent,
     trajectories_conflict,
@@ -42,7 +21,6 @@ from .trajectory import (
 )
 
 
-# ── Right-of-way at intersections (priority-to-the-right rule) ──────────────
 
 APPROACH_PRIORITY = {
     (Direction.NORTH, Direction.EAST):  "B",
@@ -57,14 +35,7 @@ APPROACH_PRIORITY = {
 
 
 def right_of_way_intersection(v1: Vehicle, v2: Vehicle) -> Optional[str]:
-    """
-    Direction-only right-of-way at a 4-way intersection (priority-to-the-right).
-
-    Backward-compat helper for callers that have no intent information.
-    Returns None when directions are opposite — this is the correct answer
-    only when BOTH vehicles go straight. Callers with intent should use
-    `right_of_way_intersection_with_intent`.
-    """
+    """Direction-only priority-to-the-right rule for a 4-way intersection."""
     key = (v1.direction, v2.direction)
     result = APPROACH_PRIORITY.get(key)
     if result == "A":
@@ -77,24 +48,7 @@ def right_of_way_intersection(v1: Vehicle, v2: Vehicle) -> Optional[str]:
 def right_of_way_intersection_with_intent(
     v1: Vehicle, v2: Vehicle
 ) -> Optional[str]:
-    """
-    Intent-aware intersection right-of-way.
-
-    Precondition: both vehicles have declared intent (v.intent is not None).
-    Raises UnsupportedScenarioError otherwise.
-
-    Resolution order:
-      1. If the two trajectories do NOT share any intersection cell, there
-         is no conflict → returns None.
-      2. Otherwise, apply yield-to-oncoming-when-turning-left:
-         if exactly one vehicle is turning left and the vehicles approach
-         from opposite directions, the left-turner yields (closes T2-B01).
-      3. Otherwise, apply priority-to-the-right via APPROACH_PRIORITY.
-         If that lookup is also undefined (same direction, identical
-         approach — not a realistic 2-vehicle scenario), raise
-         UnsupportedScenarioError rather than return None, since we know
-         from step 1 that there IS a trajectory conflict.
-    """
+    """Intent-aware right-of-way for intersection conflicts."""
     if not both_have_intent(v1, v2):
         raise UnsupportedScenarioError(
             "right_of_way_intersection_with_intent requires both vehicles "
@@ -104,12 +58,10 @@ def right_of_way_intersection_with_intent(
     if not trajectories_conflict(v1, v2):
         return None
 
-    # Step 2: yield-to-oncoming-when-turning-left
     left_yielder = _resolve_left_turn_yield(v1, v2)
     if left_yielder is not None:
         return left_yielder
 
-    # Step 3: priority-to-the-right
     key = (v1.direction, v2.direction)
     result = APPROACH_PRIORITY.get(key)
     if result == "A":
@@ -133,11 +85,7 @@ _OPPOSITE: dict[Direction, Direction] = {
 
 
 def _resolve_left_turn_yield(v1: Vehicle, v2: Vehicle) -> Optional[str]:
-    """
-    If exactly one vehicle is turning left AND the other approaches from
-    the opposite direction, the left-turner yields to the other one.
-    Returns the winner's id, or None if this rule does not apply.
-    """
+    """Return the winner when a left-turning vehicle yields to oncoming traffic."""
     v1_left = v1.intent == IntentDirection.TURN_LEFT
     v2_left = v2.intent == IntentDirection.TURN_LEFT
     if v1_left == v2_left:
@@ -147,44 +95,20 @@ def _resolve_left_turn_yield(v1: Vehicle, v2: Vehicle) -> Optional[str]:
     return v2.id if v1_left else v1.id
 
 
-# ── Right-of-way at roundabouts ──────────────────────────────────────────────
 
 def right_of_way_roundabout(v_inside: Vehicle, v_entering: Vehicle) -> str:
-    """
-    At a roundabout, vehicles already inside always have priority
-    over vehicles attempting to enter.
-
-    Precondition: v_inside must be the vehicle currently circulating inside
-    the roundabout (inside_intersection == True). The caller is responsible
-    for passing the correct vehicle as v_inside.
-    """
+    """Roundabout priority: circulating vehicles go first."""
     return v_inside.id
 
 
 def roundabout_can_enter(entering: Vehicle, vehicles_inside: list[Vehicle]) -> bool:
-    """
-    Returns True if the entering vehicle may enter the roundabout,
-    i.e. no vehicle is currently circulating inside.
-    """
+    """True when no vehicle is circulating inside the roundabout."""
     return not any(v.inside_intersection for v in vehicles_inside)
 
 
-# ── Generic dispatcher ───────────────────────────────────────────────────────
 
 def right_of_way(v1: Vehicle, v2: Vehicle, env: Environment) -> Optional[str]:
-    """
-    Environment-aware dispatcher.
-
-    Returns the id of the vehicle with priority, or None if there is no
-    conflict between the two vehicles under the rules for `env`.
-
-    Raises:
-        UnsupportedScenarioError: if the scenario falls outside the
-        supported input space for its environment. In particular, a
-        roundabout scenario where NEITHER vehicle is inside is now
-        rejected rather than silently falling back to intersection
-        priority-to-the-right (closes T2-B10).
-    """
+    """Priority vehicle id, or None if there is no conflict."""
     if env == Environment.INTERSECTION:
         if both_have_intent(v1, v2):
             return right_of_way_intersection_with_intent(v1, v2)
@@ -198,31 +122,21 @@ def right_of_way(v1: Vehicle, v2: Vehicle, env: Environment) -> Optional[str]:
         if v2_inside and not v1_inside:
             return right_of_way_roundabout(v2, v1)
         if v1_inside and v2_inside:
-            # Two vehicles simultaneously circulating is not a priority
-            # question the Task 2 ruleset answers. Reject loudly.
             raise UnsupportedScenarioError(
                 "Roundabout with both vehicles inside the ring is not a "
                 "supported right-of-way scenario."
             )
-        # Neither inside: previously fell back to intersection logic.
-        # That was wrong — roundabout approach vehicles do not have
-        # priority-to-the-right among themselves, they have nobody yet.
         raise UnsupportedScenarioError(
             "Roundabout with no vehicle inside the ring is not a supported "
             "right-of-way scenario (Task 2 requires one circulating vehicle)."
         )
 
     if env == Environment.MULTI_LANE:
-        # Multi-lane right-of-way between two arbitrary vehicles is not a
-        # Task 2 concept. Return None (no conflict) to preserve legacy
-        # behavior rather than raise; generators should not call this
-        # path for MULTI_LANE in the first place.
         return None
 
     raise UnsupportedScenarioError(f"Unknown environment: {env!r}")
 
 
-# ── Violation rules ──────────────────────────────────────────────────────────
 
 def is_violation_stop_sign(entered_without_stopping: bool) -> bool:
     """Vehicle must stop before entering intersection when stop sign is present."""
@@ -246,7 +160,6 @@ def is_violation_no_overtake(zone: str) -> bool:
     return zone == "no_overtake_zone"
 
 
-# ── Valid actions per environment ────────────────────────────────────────────
 
 VALID_ACTIONS = {
     Environment.INTERSECTION: [
@@ -267,7 +180,6 @@ def get_valid_actions(env: Environment) -> list[str]:
     return VALID_ACTIONS.get(env, [])
 
 
-# ── Overlap conditions ───────────────────────────────────────────────────────
 
 def is_overlap_possible(env: Environment) -> bool:
     return env in (Environment.INTERSECTION, Environment.ROUNDABOUT)
@@ -275,3 +187,181 @@ def is_overlap_possible(env: Environment) -> bool:
 
 def vehicles_overlap(v1: Vehicle, v2: Vehicle) -> bool:
     return v1.inside_intersection and v2.inside_intersection
+
+
+def is_valid_transition(state: ScenarioState, vehicle_id: str, action: Action) -> bool:
+    """True when the action is FSM-valid for the current state."""
+    vehicle = state.get_vehicle(vehicle_id)
+    if vehicle is None:
+        return False
+    return is_transition_applicable(vehicle, state.environment, action)
+
+
+def _violation_result(vehicle_id: str, violation_type: str, reason: str) -> dict[str, object]:
+    return {
+        "is_violation": True,
+        "vehicle": vehicle_id,
+        "violation_type": violation_type,
+        "reason": reason,
+    }
+
+
+def _ok_result(vehicle_id: str, reason: str = "No violation detected.") -> dict[str, object]:
+    return {
+        "is_violation": False,
+        "vehicle": vehicle_id,
+        "violation_type": None,
+        "reason": reason,
+    }
+
+
+def detect_fsm_violation(
+    state: ScenarioState,
+    vehicle_id: str,
+    action: Action,
+) -> dict[str, object]:
+    """Detect illegal FSM transitions."""
+    vehicle = state.get_vehicle(vehicle_id)
+    if vehicle is None:
+        return _violation_result(
+            vehicle_id,
+            "invalid_vehicle",
+            f"Vehicle {vehicle_id} is not present in the scenario state.",
+        )
+
+    if is_valid_transition(state, vehicle_id, action):
+        return _ok_result(vehicle_id, "FSM transition is valid.")
+
+    env = state.environment
+    pos = vehicle.position
+    inside = vehicle.inside_intersection
+
+    if (
+        env == Environment.INTERSECTION
+        and action in (Action.TURN_LEFT, Action.TURN_RIGHT)
+        and not inside
+    ):
+        return _violation_result(
+            vehicle_id,
+            "turn_without_entering",
+            f"Vehicle {vehicle_id} tried to turn before entering the intersection.",
+        )
+
+    if action == Action.MOVE_FORWARD and pos.endswith("_exit"):
+        return _violation_result(
+            vehicle_id,
+            "forward_from_exit",
+            f"Vehicle {vehicle_id} tried to move forward from an exit position.",
+        )
+
+    if env == Environment.MULTI_LANE and action == Action.CHANGE_LEFT and pos == Lane.LEFT.value:
+        return _violation_result(
+            vehicle_id,
+            "lane_change_out_of_bounds_left",
+            f"Vehicle {vehicle_id} tried to change left from the left lane.",
+        )
+
+    if env == Environment.MULTI_LANE and action == Action.CHANGE_RIGHT and pos == Lane.RIGHT.value:
+        return _violation_result(
+            vehicle_id,
+            "lane_change_out_of_bounds_right",
+            f"Vehicle {vehicle_id} tried to change right from the right lane.",
+        )
+
+    return _violation_result(
+        vehicle_id,
+        "invalid_fsm_transition",
+        (
+            f"Vehicle {vehicle_id} attempted an invalid transition: "
+            f"env={env.value}, position={pos}, action={action.value}."
+        ),
+    )
+
+
+def detect_right_of_way_violation(
+    state: ScenarioState,
+    vehicle_id: str,
+    action: Action,
+) -> dict[str, object]:
+    """Detect right-of-way violations."""
+    vehicle = state.get_vehicle(vehicle_id)
+    if vehicle is None:
+        return _violation_result(
+            vehicle_id,
+            "invalid_vehicle",
+            f"Vehicle {vehicle_id} is not present in the scenario state.",
+        )
+
+    env = state.environment
+
+    if env == Environment.INTERSECTION and action == Action.MOVE_FORWARD:
+        if vehicle.inside_intersection or not vehicle.position.endswith("_approach"):
+            return _ok_result(vehicle_id, "Not an intersection entry action.")
+
+        for other in state.vehicles:
+            if other.id == vehicle_id:
+                continue
+            if other.inside_intersection and other.position == "inside_intersection":
+                return _violation_result(
+                    vehicle_id,
+                    "intersection_right_of_way",
+                    (
+                        f"Vehicle {vehicle_id} entered while Vehicle {other.id} "
+                        "was already inside the intersection."
+                    ),
+                )
+
+        for other in state.vehicles:
+            if other.id == vehicle_id:
+                continue
+            if other.inside_intersection or not other.position.endswith("_approach"):
+                continue
+            winner = right_of_way(vehicle, other, Environment.INTERSECTION)
+            if winner is None:
+                continue
+            if winner != vehicle_id:
+                return _violation_result(
+                    vehicle_id,
+                    "intersection_right_of_way",
+                    (
+                        f"Vehicle {vehicle_id} moved forward without right of way; "
+                        f"Vehicle {winner} had priority."
+                    ),
+                )
+        return _ok_result(vehicle_id, "Intersection right-of-way respected.")
+
+    if env == Environment.ROUNDABOUT and action == Action.ENTER_ROUNDABOUT:
+        inside_others = [
+            v for v in state.vehicles
+            if v.id != vehicle_id and v.inside_intersection
+        ]
+        if is_violation_roundabout_entry(vehicle, inside_others):
+            inside_ids = ", ".join(v.id for v in inside_others)
+            return _violation_result(
+                vehicle_id,
+                "roundabout_entry_no_yield",
+                (
+                    f"Vehicle {vehicle_id} entered the roundabout without yielding; "
+                    f"circulating vehicle(s): {inside_ids}."
+                ),
+            )
+        return _ok_result(vehicle_id, "Roundabout entry respected priority.")
+
+    return _ok_result(vehicle_id, "No right-of-way rule applies to this action.")
+
+
+def detect_violation(
+    state: ScenarioState,
+    vehicle_id: str,
+    action: Action,
+) -> dict[str, object]:
+    """Run FSM and right-of-way checks for one action."""
+    fsm_result = detect_fsm_violation(state, vehicle_id, action)
+    if bool(fsm_result["is_violation"]):
+        return fsm_result
+
+    row_result = detect_right_of_way_violation(state, vehicle_id, action)
+    if bool(row_result["is_violation"]):
+        return row_result
+
+    return _ok_result(vehicle_id)

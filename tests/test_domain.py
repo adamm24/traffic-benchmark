@@ -1,25 +1,4 @@
-"""
-Smoke tests for the domain layer.
-
-These are intentionally compact. They cover the three invariants that
-changed in this refactor:
-
-  1. FSM guard (domain.fsm + domain.scenario.apply_action):
-     invalid transitions must return "" without mutating state.
-
-  2. Trajectory conflict detection (domain.trajectory):
-     perpendicular GO_STRAIGHT movements conflict, opposite
-     GO_STRAIGHT movements do not, and a left turn across an oncoming
-     straight movement IS flagged as a conflict.
-
-  3. Roundabout dispatcher (domain.rules.right_of_way):
-     roundabout-without-inside-vehicle is rejected as
-     UnsupportedScenarioError instead of silently falling back to
-     intersection logic.
-
-Run with:
-    python -m unittest tests.test_domain
-"""
+"""Smoke tests for the domain layer."""
 from __future__ import annotations
 
 import sys
@@ -46,11 +25,14 @@ from domain.fsm import (
     valid_actions,
 )
 from domain.rules import right_of_way
+from domain.rules import detect_fsm_violation
+from domain.rules import detect_right_of_way_violation
+from domain.rules import detect_violation
+from domain.rules import is_valid_transition
 from domain.scenario import apply_action
 from domain.trajectory import trajectories_conflict, trajectory_of
 
 
-# ── FSM tests ───────────────────────────────────────────────────────────────
 
 class FSMTests(unittest.TestCase):
     def test_intersection_approaching_move_forward(self):
@@ -99,7 +81,6 @@ class FSMTests(unittest.TestCase):
         self.assertNotIn(Action.MOVE_FORWARD, actions)
 
 
-# ── Trajectory tests ────────────────────────────────────────────────────────
 
 def _v(vid: str, direction: Direction, intent: IntentDirection) -> Vehicle:
     return Vehicle(
@@ -132,7 +113,6 @@ class TrajectoryTests(unittest.TestCase):
         self.assertEqual(len(trajectory_of(a)), 1)
 
 
-# ── Dispatcher tests ────────────────────────────────────────────────────────
 
 class DispatcherTests(unittest.TestCase):
     def test_roundabout_no_inside_vehicle_raises(self):
@@ -171,6 +151,66 @@ class DispatcherTests(unittest.TestCase):
         a = _v("A", Direction.NORTH, IntentDirection.GO_STRAIGHT)
         b = _v("B", Direction.SOUTH, IntentDirection.GO_STRAIGHT)
         self.assertIsNone(right_of_way(a, b, Environment.INTERSECTION))
+
+
+class ViolationDetectionTests(unittest.TestCase):
+    def test_turn_without_entering_detected(self):
+        v = Vehicle(id="A", position="north_approach", direction=Direction.NORTH)
+        state = ScenarioState(vehicles=[v], environment=Environment.INTERSECTION)
+        out = detect_fsm_violation(state, "A", Action.TURN_LEFT)
+        self.assertTrue(out["is_violation"])
+        self.assertEqual(out["violation_type"], "turn_without_entering")
+
+    def test_forward_from_exit_detected(self):
+        v = Vehicle(id="A", position="east_exit", direction=Direction.EAST)
+        state = ScenarioState(vehicles=[v], environment=Environment.INTERSECTION)
+        out = detect_fsm_violation(state, "A", Action.MOVE_FORWARD)
+        self.assertTrue(out["is_violation"])
+        self.assertEqual(out["violation_type"], "forward_from_exit")
+
+    def test_lane_boundaries_detected(self):
+        vl = Vehicle(id="A", position="left_lane", direction=Direction.NORTH)
+        vr = Vehicle(id="B", position="right_lane", direction=Direction.NORTH)
+        state = ScenarioState(
+            vehicles=[vl, vr],
+            environment=Environment.MULTI_LANE,
+        )
+        left = detect_fsm_violation(state, "A", Action.CHANGE_LEFT)
+        right = detect_fsm_violation(state, "B", Action.CHANGE_RIGHT)
+        self.assertTrue(left["is_violation"])
+        self.assertEqual(left["violation_type"], "lane_change_out_of_bounds_left")
+        self.assertTrue(right["is_violation"])
+        self.assertEqual(right["violation_type"], "lane_change_out_of_bounds_right")
+
+    def test_intersection_right_of_way_violation_detected(self):
+        a = Vehicle(id="A", position="north_approach", direction=Direction.NORTH)
+        b = Vehicle(id="B", position="east_approach", direction=Direction.EAST)
+        c = Vehicle(id="C", position="south_approach", direction=Direction.SOUTH)
+        state = ScenarioState(vehicles=[a, b, c], environment=Environment.INTERSECTION)
+        out = detect_right_of_way_violation(state, "A", Action.MOVE_FORWARD)
+        self.assertTrue(out["is_violation"])
+        self.assertEqual(out["violation_type"], "intersection_right_of_way")
+
+    def test_roundabout_entry_violation_detected(self):
+        a = Vehicle(id="A", position="north_approach", direction=Direction.NORTH)
+        b = Vehicle(
+            id="B",
+            position="roundabout_lane",
+            direction=Direction.EAST,
+            inside_intersection=True,
+        )
+        c = Vehicle(id="C", position="west_approach", direction=Direction.WEST)
+        state = ScenarioState(vehicles=[a, b, c], environment=Environment.ROUNDABOUT)
+        out = detect_right_of_way_violation(state, "A", Action.ENTER_ROUNDABOUT)
+        self.assertTrue(out["is_violation"])
+        self.assertEqual(out["violation_type"], "roundabout_entry_no_yield")
+
+    def test_stop_is_legal_and_transition_valid(self):
+        v = Vehicle(id="A", position="north_approach", direction=Direction.NORTH)
+        state = ScenarioState(vehicles=[v], environment=Environment.INTERSECTION)
+        self.assertTrue(is_valid_transition(state, "A", Action.STOP))
+        out = detect_violation(state, "A", Action.STOP)
+        self.assertFalse(out["is_violation"])
 
 
 if __name__ == "__main__":

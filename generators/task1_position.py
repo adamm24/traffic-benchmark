@@ -1,41 +1,4 @@
-"""
-Task 1 — Position Tracking Generator
-=====================================
-Generates multiple-choice questions that test an LLM's ability to track
-vehicle positions through a sequence of actions.
-
-Environments: multi_lane_road, intersection  (roundabout excluded)
-Vehicles:     3
-Steps:        2–4
-Choices:      1 correct, 2 near_true, 2 highly_false
-
-Post-refactor guarantees (addresses T1 improvement plan):
-  • Distractor quality:
-      near_true_1 = queried vehicle's START position.
-      near_true_2 = another tracked vehicle's FINAL position in the same
-                    environment (principled, grounded in the scenario).
-      highly_false_1 = cross-environment label (e.g. a lane on an
-                       intersection scenario).
-      highly_false_2 = same-environment label that was never actually
-                       visited by any vehicle (rules out shallow "pick
-                       any in-env label" heuristics).
-  • No hardcoded fallback strings. All labels flow through
-    domain.vocabulary. If a label cannot be found the example is
-    REJECTED and retried — never replaced with a placeholder.
-  • Audit metadata: every example embeds an "audit" block with the full
-    queried-vehicle trace, per-distractor rationale, invariant flags,
-    and generation metadata (seed, generator version).
-  • Deterministic with --seed (env RNG only, independent of system RNG).
-  • Scale-ready: N_EXAMPLES can be set to 300 via CLI without changing
-    the generator; per-env and per-key balance are enforced by the
-    key_schedule and a soft env-balance retry loop.
-  • FSM-backed: apply_action() now self-rejects invalid transitions
-    (returns ""); safe_apply_action() below is a thin wrapper that
-    converts "" → None so existing call sites keep working.
-
-Usage:
-    python generators/task1_position.py --n 300 --seed 42
-"""
+"""Task 1 position-tracking generator."""
 
 from __future__ import annotations
 
@@ -47,52 +10,176 @@ import random
 import sys
 from pathlib import Path
 
-# ── Make project root importable ────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from domain.entities import (
-    Action, Environment, ScenarioState, Vehicle,
+    Action, Direction, Environment, ScenarioState, Vehicle,
 )
 from domain.scenario import (
-    LANE_ORDER, apply_action,
-    build_intersection_scenario, build_multi_lane_scenario,
+    apply_action,
+    build_intersection_scenario,
 )
-from domain.render import describe_scenario, render_prompt
+from domain.render import render_prompt
 from domain.vocabulary import (
-    highly_false_labels_for_env, is_env_consistent_label, is_valid_label,
-    label_of, labels_for_env, positions_for_env,
+    is_valid_label,
+    label_of, labels_for_env,
 )
 
-# ── Constants ───────────────────────────────────────────────────────────────
 
-GENERATOR_VERSION = "task1_position.v3"   # bump when contract changes
+GENERATOR_VERSION = "task1_position.v14"   # bump when contract changes
 DEFAULT_N_EXAMPLES = 100                  # CLI --n overrides; 300 = full core
 NUM_VEHICLES = 3
-MIN_STEPS    = 2
-MAX_STEPS    = 4
-MAX_RETRIES  = 50                         # per-example retry budget
+MIN_STEPS    = 3
+MAX_STEPS    = 5
+MAX_RETRIES  = 150                        # per-example retry budget
 MAX_CONSEC   = 2                          # max consecutive actions by same vehicle
+MIN_DISTINCT_ACTORS  = 2                  # harder sequences: at least 2 vehicles act
+MIN_DISTINCT_ACTIONS = 2                  # avoid monotone one-action plans
+SEQUENCE_TRIES_PER_ATTEMPT = 8            # local retries before burning outer attempt
+CHOICE_RETRIES_PER_PLAN = 6               # avoid losing attempt to one unlucky draw
+MULTI_LANE_ONE_SHOULDER_START_PROB = 0.55
+MULTI_LANE_TWO_SHOULDER_START_PROB = 0.45
+MULTI_LANE_HF_SHOULDER_WEIGHT = 0.05
+MULTI_LANE_HF_SHOULDER_RATIO_CAP = 0.38
+INTERSECTION_INSIDE_START_PROB = 0.60
+INTERSECTION_INSIDE_QUERY_BIAS = 0.45
+MULTI_LANE_BALANCE_WARMUP = 18
+MULTI_LANE_CORRECT_LABEL_GAP = 6
+INTERSECTION_BALANCE_WARMUP = 18
+INTERSECTION_CORRECT_LABEL_GAP = 7
+TASK_SLOT_RETRIES = 240
+PLAN_TEMPLATE_MAX_REUSE = 8
+INTERSECTION_QUERIED_SHAPE_MAX_REUSE = 19
+MULTI_LANE_QUERIED_SHAPE_MAX_REUSE = 16
 
-TASK_ENVS = [Environment.MULTI_LANE, Environment.INTERSECTION]
+INTERSECTION_ALLOWED_CHOICE_LABELS = {
+    "inside the intersection",
+    "the northern exit",
+    "the southern exit",
+    "the eastern exit",
+    "the western exit",
+}
+INTERSECTION_CORRECT_LABELS = {
+    "the northern exit",
+    "the southern exit",
+    "the eastern exit",
+    "the western exit",
+}
+
+TASK_ENVS = [Environment.INTERSECTION, Environment.MULTI_LANE]
+
+DIFFICULTIES = ["easy", "medium", "hard"]
+
+# Difficulty profiles are tuned for benchmark-quality variance:
+# - easy:  still multi-step, moderate interaction
+# - medium: stronger interaction and less lexical shortcut room
+# - hard: max interaction, stronger ambiguity pressure
+DIFFICULTY_PROFILES: dict[str, dict] = {
+    "easy": {
+        "allowed_envs": [Environment.INTERSECTION, Environment.MULTI_LANE],
+        "step_min": 3,
+        "step_max": 4,
+        "min_queried_moves": 1,
+        "max_queried_moves": 2,
+        "min_distinct_actors": 2,
+        "min_distinct_actions": 1,
+        "min_nonqueried_moves": 1,
+        "min_vehicles_moved": 2,
+        "require_queried_interleaving": False,
+        "require_near_true_from_other": False,
+        "require_other_vehicle_multi_step": False,
+        "prefer_ambiguous_families": False,
+    },
+    "medium": {
+        "allowed_envs": [Environment.INTERSECTION, Environment.MULTI_LANE],
+        "step_min": 3,
+        "step_max": 5,
+        "min_queried_moves": 2,
+        "max_queried_moves": 3,
+        "min_distinct_actors": 2,
+        "min_distinct_actions": 2,
+        "min_nonqueried_moves": 2,
+        "min_vehicles_moved": 2,
+        "require_queried_interleaving": True,
+        "require_near_true_from_other": True,
+        "require_other_vehicle_multi_step": False,
+        "prefer_ambiguous_families": False,
+    },
+    "hard": {
+        "allowed_envs": [Environment.INTERSECTION, Environment.MULTI_LANE],
+        "step_min": 4,
+        "step_max": 5,
+        "min_queried_moves": 2,
+        "max_queried_moves": 4,
+        "min_distinct_actors": 3,
+        "min_distinct_actions": 2,
+        "min_nonqueried_moves": 3,
+        "min_vehicles_moved": 3,
+        "require_queried_interleaving": True,
+        "require_near_true_from_other": True,
+        "require_other_vehicle_multi_step": True,
+        "prefer_ambiguous_families": True,
+    },
+}
+
+QUESTION_TEMPLATES = [
+    "Where is Vehicle {vid} at the end of the sequence?",
+    "After all events, what is Vehicle {vid}'s final position?",
+    "Track Vehicle {vid}. Which position does it occupy at the end?",
+    "Based on the full sequence, where does Vehicle {vid} end up?",
+]
+
+EVENT_HEADER_TEMPLATES = [
+    "Sequence of events:",
+    "Event sequence:",
+    "Observed actions:",
+    "Action log:",
+]
+
+QUESTION_HEADER_TEMPLATES = [
+    "Question:",
+    "Final question:",
+    "Task:",
+]
 
 # Actions valid per environment (Task 1 — position only, no roundabout)
-# NOTE: MOVE_FORWARD excluded from MULTI_LANE because it doesn't change
-#       the lane position and would be a no-op for position tracking.
+# MOVE_FORWARD excluded from MULTI_LANE: it doesn't change lane position,
+# so it's a no-op for position tracking.
 ACTIONS_BY_ENV = {
     Environment.MULTI_LANE: [
         Action.CHANGE_LEFT,
         Action.CHANGE_RIGHT,
     ],
     Environment.INTERSECTION: [
+        Action.STOP,
         Action.MOVE_FORWARD,
         Action.TURN_LEFT,
         Action.TURN_RIGHT,
     ],
 }
 
+# 4-lane highway-like model + symmetric shoulders (reachable edge states).
+MULTI_LANE_STATE_ORDER = [
+    "left_shoulder",
+    "far_left_lane",
+    "left_center_lane",
+    "right_center_lane",
+    "far_right_lane",
+    "right_shoulder",
+]
+MULTI_LANE_DRIVING_STATES = [
+    "far_left_lane",
+    "left_center_lane",
+    "right_center_lane",
+    "far_right_lane",
+]
+MAX_QUERIED_MOVES_BY_ENV = {
+    Environment.INTERSECTION: 2,
+    Environment.MULTI_LANE: 4,
+}
 
-# ── FSM-compatible action wrapper ───────────────────────────────────────────
+
 
 
 
@@ -121,13 +208,410 @@ def safe_apply_action(
     return result if result else None
 
 
-# ── Sequence generation ─────────────────────────────────────────────────────
+def _apply_multi_lane_action(
+    state: ScenarioState,
+    vehicle_id: str,
+    action: Action,
+) -> str | None:
+    """Task1-local 4-lane+shoulder transition model for multi-lane prompts."""
+    v = state.get_vehicle(vehicle_id)
+    if v is None:
+        raise ValueError(f"Vehicle {vehicle_id!r} not found in scenario state.")
+    if v.position not in MULTI_LANE_STATE_ORDER:
+        return None
+    idx = MULTI_LANE_STATE_ORDER.index(v.position)
+    if action == Action.CHANGE_LEFT:
+        if idx == 0:
+            return None
+        new_pos = MULTI_LANE_STATE_ORDER[idx - 1]
+        v.position = new_pos
+        if new_pos == "left_shoulder":
+            event = f"Vehicle {v.id} moves onto the left shoulder."
+        else:
+            event = f"Vehicle {v.id} changes to the left lane."
+    elif action == Action.CHANGE_RIGHT:
+        if idx == len(MULTI_LANE_STATE_ORDER) - 1:
+            return None
+        new_pos = MULTI_LANE_STATE_ORDER[idx + 1]
+        v.position = new_pos
+        if new_pos == "right_shoulder":
+            event = f"Vehicle {v.id} moves onto the right shoulder."
+        else:
+            event = f"Vehicle {v.id} changes to the right lane."
+    else:
+        return None
+    state.event_log.append(event)
+    state.step += 1
+    return event
+
+
+def _safe_apply_action_for_env(
+    state: ScenarioState,
+    vehicle_id: str,
+    action: Action,
+    env: Environment,
+) -> str | None:
+    if env == Environment.MULTI_LANE:
+        return _apply_multi_lane_action(state, vehicle_id, action)
+    return safe_apply_action(state, vehicle_id, action)
+
+
+def _build_multi_lane_scenario(
+    num_vehicles: int = 3,
+    *,
+    compact_starts: bool = False,
+) -> ScenarioState:
+    """Task1-local multi-lane builder with controlled shoulder frequency."""
+    if compact_starts and num_vehicles >= 3:
+        # Hard-mode compact starts leave room for multi-step interaction
+        # under the strict "keep at least 2 unvisited labels" constraint.
+        lane_a = random.choice(MULTI_LANE_DRIVING_STATES)
+        lane_b = random.choice([s for s in MULTI_LANE_DRIVING_STATES if s != lane_a])
+        starts = [lane_a, lane_a, lane_b]
+        random.shuffle(starts)
+    else:
+        starts = random.sample(MULTI_LANE_DRIVING_STATES, num_vehicles)
+    # Controlled shoulder starts keep shoulder labels represented in real
+    # trajectories (not only as distractors), reducing shortcut bias.
+    if compact_starts:
+        two_shoulder_prob = MULTI_LANE_TWO_SHOULDER_START_PROB * 0.15
+        one_shoulder_prob = MULTI_LANE_ONE_SHOULDER_START_PROB * 0.35
+    else:
+        two_shoulder_prob = MULTI_LANE_TWO_SHOULDER_START_PROB
+        one_shoulder_prob = MULTI_LANE_ONE_SHOULDER_START_PROB
+    r = random.random()
+    if r < two_shoulder_prob and num_vehicles >= 2:
+        left_idx, right_idx = random.sample(range(num_vehicles), 2)
+        starts[left_idx] = "left_shoulder"
+        starts[right_idx] = "right_shoulder"
+    elif r < (two_shoulder_prob + one_shoulder_prob):
+        shoulder = random.choice(["left_shoulder", "right_shoulder"])
+        replace_idx = random.randrange(num_vehicles)
+        starts[replace_idx] = shoulder
+    vehicles: list[Vehicle] = []
+    for i, pos in enumerate(starts):
+        vehicles.append(Vehicle(
+            id=chr(65 + i),
+            position=pos,
+            direction=Direction.NORTH,
+        ))
+    return ScenarioState(vehicles=vehicles, environment=Environment.MULTI_LANE)
+
+
+def _build_intersection_scenario_task1(num_vehicles: int = 3) -> ScenarioState:
+    """
+    Intersection builder with occasional in-progress traffic:
+    one vehicle may start inside the intersection body.
+    This increases valid queried-shape diversity while staying domain-valid.
+    """
+    state = build_intersection_scenario(num_vehicles, with_intent=False)
+    if random.random() < INTERSECTION_INSIDE_START_PROB:
+        v = random.choice(state.vehicles)
+        v.position = "inside_intersection"
+        v.inside_intersection = True
+    return state
+
+
+def _is_abab_vehicle_pattern(window: list[str]) -> bool:
+    """True for a 4-step vehicle-id window shaped A-B-A-B with A != B."""
+    return (
+        len(window) == 4
+        and window[0] == window[2]
+        and window[1] == window[3]
+        and window[0] != window[1]
+    )
+
+
+def _would_create_abab_vehicle_pattern(
+    plan: list[tuple[str, Action]],
+    next_vid: str,
+) -> bool:
+    """Checks whether appending next_vid would make the last 4 steps A-B-A-B."""
+    recent_vids = [vid for vid, _ in plan[-3:]]
+    return _is_abab_vehicle_pattern(recent_vids + [next_vid])
+
+
+def _contains_abab_vehicle_pattern(plan: list[tuple[str, Action]]) -> bool:
+    """True iff any 4-step window in plan is A-B-A-B on vehicle ids."""
+    vids = [vid for vid, _ in plan]
+    return any(
+        _is_abab_vehicle_pattern(vids[i:i + 4])
+        for i in range(0, max(0, len(vids) - 3))
+    )
+
+
+def _has_action_streak(plan: list[tuple[str, Action]], streak_len: int = 3) -> bool:
+    """True if same action appears `streak_len` times consecutively."""
+    if streak_len <= 1:
+        return False
+    acts = [act for _, act in plan]
+    for i in range(0, len(acts) - streak_len + 1):
+        window = acts[i:i + streak_len]
+        if len(set(window)) == 1:
+            return True
+    return False
+
+
+def _queried_moves_interleaved(plan: list[tuple[str, Action]], queried_vid: str) -> bool:
+    """True iff queried vehicle's moves are separated by at least one other move."""
+    idxs = [i for i, (vid, _) in enumerate(plan) if vid == queried_vid]
+    if len(idxs) <= 1:
+        return True
+    return all((b - a) > 1 for a, b in zip(idxs, idxs[1:]))
+
+
+def _has_vehicle_palindrome(plan: list[tuple[str, Action]]) -> bool:
+    """Reject symmetric actor patterns like A-B-C-B-A."""
+    vids = [vid for vid, _ in plan]
+    return len(vids) >= 5 and vids == list(reversed(vids))
+
+
+def _difficulty_profile(name: str) -> dict:
+    if name not in DIFFICULTY_PROFILES:
+        return DIFFICULTY_PROFILES["medium"]
+    return DIFFICULTY_PROFILES[name]
+
+
+def _profile_for_env(profile: dict, env: Environment, difficulty: str) -> dict:
+    """
+    Environment-aware profile tuning: keep correctness strict, relax only
+    high-rejection pressure for multi-lane to avoid generation collapse.
+    """
+    tuned = copy.deepcopy(profile)
+    if env == Environment.INTERSECTION:
+        if difficulty == "easy":
+            tuned["step_min"] = 4
+            tuned["step_max"] = 5
+            tuned["min_queried_moves"] = 2
+            tuned["max_queried_moves"] = 2
+            tuned["min_distinct_actors"] = 2
+            tuned["min_distinct_actions"] = 1
+            tuned["min_nonqueried_moves"] = 2
+            tuned["min_vehicles_moved"] = 2
+            tuned["require_queried_interleaving"] = False
+            tuned["require_other_vehicle_multi_step"] = True
+            tuned["prefer_ambiguous_families"] = False
+        elif difficulty == "medium":
+            tuned["step_min"] = 5
+            tuned["step_max"] = 5
+            tuned["min_queried_moves"] = 2
+            tuned["max_queried_moves"] = 2
+            tuned["min_distinct_actors"] = 2
+            tuned["min_distinct_actions"] = 2
+            tuned["min_nonqueried_moves"] = 2
+            tuned["min_vehicles_moved"] = 2
+            tuned["require_queried_interleaving"] = True
+            tuned["require_other_vehicle_multi_step"] = True
+            tuned["prefer_ambiguous_families"] = False
+        else:  # hard
+            tuned["step_min"] = 5
+            tuned["step_max"] = 5
+            tuned["min_queried_moves"] = 2
+            tuned["max_queried_moves"] = 2
+            tuned["min_distinct_actors"] = 3
+            tuned["min_distinct_actions"] = 2
+            tuned["min_nonqueried_moves"] = 3
+            tuned["min_vehicles_moved"] = 3
+            tuned["require_queried_interleaving"] = True
+            tuned["require_other_vehicle_multi_step"] = True
+            tuned["prefer_ambiguous_families"] = True
+    elif env == Environment.MULTI_LANE:
+        if difficulty == "easy":
+            tuned["step_min"] = 3
+            tuned["step_max"] = 3
+            tuned["min_queried_moves"] = 1
+            tuned["max_queried_moves"] = 2
+            tuned["min_distinct_actors"] = 2
+            tuned["min_distinct_actions"] = 1
+            tuned["min_nonqueried_moves"] = 1
+            tuned["min_vehicles_moved"] = 2
+            tuned["require_queried_interleaving"] = False
+            tuned["require_other_vehicle_multi_step"] = False
+            tuned["prefer_ambiguous_families"] = False
+        elif difficulty == "medium":
+            tuned["step_min"] = 3
+            tuned["step_max"] = 4
+            tuned["min_queried_moves"] = 2
+            tuned["max_queried_moves"] = 3
+            tuned["min_distinct_actors"] = 2
+            tuned["min_distinct_actions"] = 1
+            tuned["min_nonqueried_moves"] = 1
+            tuned["min_vehicles_moved"] = 2
+            tuned["require_queried_interleaving"] = True
+            tuned["require_other_vehicle_multi_step"] = False
+            tuned["prefer_ambiguous_families"] = False
+        else:  # hard
+            tuned["step_min"] = 5
+            tuned["step_max"] = 5
+            tuned["min_queried_moves"] = 2
+            tuned["max_queried_moves"] = 3
+            tuned["min_distinct_actors"] = 3
+            tuned["min_distinct_actions"] = 2
+            tuned["min_nonqueried_moves"] = 2
+            tuned["min_vehicles_moved"] = 3
+            tuned["require_queried_interleaving"] = True
+            tuned["require_other_vehicle_multi_step"] = False
+            tuned["prefer_ambiguous_families"] = True
+    return tuned
+
+
+def _inc(counter: dict[str, int] | None, key: str) -> None:
+    if counter is None:
+        return
+    counter[key] = counter.get(key, 0) + 1
+
+
+def _choice_labels_for_env(env: Environment) -> list[str]:
+    labels = list(labels_for_env(env))
+    if env == Environment.INTERSECTION:
+        labels = [lab for lab in labels if lab in INTERSECTION_ALLOWED_CHOICE_LABELS]
+    return labels
+
+
+def _plan_template_key(plan: list[tuple[str, Action]], queried_vid: str, env: Environment) -> tuple:
+    return (
+        env.value,
+        tuple(
+            ("Q" if vid == queried_vid else "O", act.name)
+            for vid, act in plan
+        ),
+    )
+
+
+def _plan_template_from_example(example: dict) -> tuple:
+    env = Environment(example["metadata"]["environment"])
+    queried = example["metadata"]["queried_vehicle"]
+    plan_raw = example["audit"]["plan"]
+    return (
+        env.value,
+        tuple(
+            ("Q" if vid == queried else "O", act_name)
+            for vid, act_name in plan_raw
+        ),
+    )
+
+
+def _queried_shape_from_example(example: dict) -> tuple:
+    env = Environment(example["metadata"]["environment"])
+    queried = example["metadata"]["queried_vehicle"]
+    plan_raw = example["audit"]["plan"]
+    queried_actions = tuple(
+        act_name for vid, act_name in plan_raw if vid == queried
+    )
+    return (env.value, queried_actions)
+
+
+def _pick_question(queried_vid: str) -> str:
+    return random.choice(QUESTION_TEMPLATES).format(vid=queried_vid)
+
+
+def _render_prompt_with_variation(
+    scenario_text: str,
+    events: list[str],
+    question: str,
+    choices: dict[str, str],
+) -> tuple[str, str, str]:
+    """Vary prompt headers without changing task semantics."""
+    base = render_prompt(scenario_text, events, question, choices)
+    ev_header = random.choice(EVENT_HEADER_TEMPLATES)
+    q_header = random.choice(QUESTION_HEADER_TEMPLATES)
+    prompt = base.replace("Sequence of events:", ev_header, 1)
+    prompt = prompt.replace("Question:", q_header, 1)
+    return prompt, ev_header, q_header
+
+
+def _describe_task1_scenario(state: ScenarioState) -> str:
+    """Task 1 scenario text using the controlled vocabulary."""
+    count_word = {2: "Two", 3: "Three", 4: "Four", 5: "Five"}.get(
+        len(state.vehicles), str(len(state.vehicles))
+    )
+    env_label = {
+        Environment.INTERSECTION: "an intersection",
+        Environment.MULTI_LANE: "a multi-lane road",
+        Environment.ROUNDABOUT: "a roundabout",
+    }.get(state.environment, state.environment.value)
+    lines = [f"{count_word} vehicles are at {env_label}."]
+    for v in state.vehicles:
+        desc = f"Vehicle {v.id} is in {label_of(v.position)}"
+        if v.intent:
+            desc += f", intending to {v.intent.value}"
+        lines.append(desc + ".")
+    return "\n".join(lines)
+
+
+def _label_family(label: str) -> str:
+    ll = label.lower()
+    if "approach" in ll:
+        return "approach"
+    if "exit" in ll:
+        return "exit"
+    if "inside the intersection" in ll:
+        return "inside"
+    if "lane" in ll or "strip" in ll or "shoulder" in ll:
+        return "lane_like"
+    return "other"
+
+
+def _is_shoulder_label(label: str) -> bool:
+    return "shoulder" in label.lower()
+
+
+def _weighted_label_pick(labels: list[str], weights: list[float]) -> str:
+    return random.choices(labels, weights=weights, k=1)[0]
+
+
+def _weighted_pick_two_distinct(labels: list[str], weights: list[float]) -> tuple[str, str]:
+    first = _weighted_label_pick(labels, weights)
+    rem_labels = [lab for lab in labels if lab != first]
+    if not rem_labels:
+        raise ValueError("Need at least two distinct labels.")
+    rem_weights = [weights[labels.index(lab)] for lab in rem_labels]
+    second = _weighted_label_pick(rem_labels, rem_weights)
+    return first, second
+
+
+def _hf_weight(
+    label: str,
+    env: Environment,
+    hf_label_usage: dict[str, int] | None,
+) -> float:
+    usage = 0 if hf_label_usage is None else hf_label_usage.get(label, 0)
+    w = 1.0 / (1.0 + usage)
+    if env == Environment.MULTI_LANE and _is_shoulder_label(label):
+        w *= MULTI_LANE_HF_SHOULDER_WEIGHT
+    return w
+
+
+def _example_signature(example: dict) -> tuple:
+    """Dedup key: (env, init_state, plan, queried_vehicle)."""
+    vehicles = tuple(sorted(
+        (v["id"], v["position"], v["direction"])
+        for v in example["scenario"]["vehicles"]
+    ))
+    plan = tuple(tuple(step) for step in example["audit"]["plan"])
+    queried = example["metadata"]["queried_vehicle"]
+    env = example["metadata"]["environment"]
+    return (env, vehicles, queried, plan)
+
+
 
 def generate_sequence(
     state: ScenarioState,
     queried_vid: str,
     env: Environment,
     n_steps: int,
+    *,
+    min_queried_moves: int,
+    max_queried_moves: int,
+    min_distinct_actors: int,
+    min_distinct_actions: int,
+    min_nonqueried_moves: int,
+    min_vehicles_moved: int,
+    require_queried_interleaving: bool,
+    require_other_vehicle_multi_step: bool,
+    max_unique_positions: int | None = None,
+    choice_label_cap: int | None = None,
+    choice_label_vocab: set[str] | None = None,
 ) -> list[tuple[str, Action]] | None:
     """
     Produces a valid n-step event sequence guaranteeing:
@@ -138,6 +622,7 @@ def generate_sequence(
       • No consecutive identical (vehicle, action) pairs.
       • At most MAX_CONSEC consecutive actions performed by the same
         vehicle (prevents "A acts 4 times in a row" monotony).
+      • No 4-step alternating vehicle pattern A-B-A-B.
       • Anti-zigzag: a vehicle's new position must not equal its position
         from 2 moves ago (prevents X → Y → X round-trips within the
         same vehicle's own trajectory).
@@ -149,7 +634,14 @@ def generate_sequence(
     valid_actions = ACTIONS_BY_ENV[env]
     start_pos = get_required_vehicle(state, queried_vid).position
 
-    min_queried_moves = 2 if env == Environment.INTERSECTION else 1
+    min_queried_moves = max(1, min_queried_moves)
+    max_queried_moves = max(min_queried_moves, max_queried_moves)
+    min_distinct_actors = max(1, min_distinct_actors)
+    min_distinct_actions = max(1, min_distinct_actions)
+    min_nonqueried_moves = max(0, min_nonqueried_moves)
+    min_vehicles_moved = max(1, min_vehicles_moved)
+    if min_queried_moves > n_steps:
+        return None
 
     for _ in range(MAX_RETRIES):
         trial_state = copy.deepcopy(state)
@@ -164,6 +656,11 @@ def generate_sequence(
         for step_idx in range(n_steps):
             remaining = n_steps - step_idx
             queried_deficit = min_queried_moves - queried_move_count
+            nonqueried_moves_done = len(plan) - queried_move_count
+            nonqueried_deficit = min_nonqueried_moves - nonqueried_moves_done
+            moved_vehicles_so_far = {v_id for v_id, _ in plan}
+            new_actor_deficit = min_vehicles_moved - len(moved_vehicles_so_far)
+            unmoved_actors = [v for v in vehicle_ids if v not in moved_vehicles_so_far]
 
             # Who has acted in the last MAX_CONSEC slots (for the ban).
             recent_vids = [p[0] for p in plan[-MAX_CONSEC:]]
@@ -177,24 +674,42 @@ def generate_sequence(
             # Forced-choice branches (queried-move quota) still respected,
             # but the consecutive-vehicle ban is applied wherever it can
             # co-exist with the quota requirement.
-            if queried_deficit >= remaining:
-                vid = queried_vid
-            elif step_idx == n_steps - 1 and queried_move_count == 0:
+            force_queried = (
+                queried_deficit >= remaining
+                or (step_idx == n_steps - 1 and queried_move_count == 0)
+            )
+            force_nonqueried = nonqueried_deficit >= remaining and not force_queried
+            force_new_actor = new_actor_deficit >= remaining and not force_queried
+            queried_at_cap = queried_move_count >= max_queried_moves
+            if force_queried:
                 vid = queried_vid
             else:
-                candidates = [v for v in vehicle_ids if v != banned_vid]
+                candidates = [v for v in vehicle_ids if not (queried_at_cap and v == queried_vid)]
+                if force_nonqueried:
+                    candidates = [v for v in candidates if v != queried_vid]
+                if force_new_actor:
+                    candidates = [v for v in candidates if v in unmoved_actors]
                 if not candidates:
-                    candidates = list(vehicle_ids)
+                    break
+                candidates_wo_ban = [v for v in candidates if v != banned_vid]
+                if candidates_wo_ban:
+                    candidates = candidates_wo_ban
+                if queried_at_cap:
+                    candidates = [v for v in candidates if v != queried_vid]
                 vid = random.choice(candidates)
 
             # Build a candidate (vehicle, action) pool. First try the
             # chosen vid; if every action of that vid fails the soft
             # constraints, fall back to other vids before giving up.
             vid_order = [vid] + [v for v in vehicle_ids if v != vid]
+            if queried_at_cap and not force_queried:
+                vid_order = [v for v in vid_order if v != queried_vid]
+            if force_nonqueried:
+                vid_order = [v for v in vid_order if v != queried_vid]
+            if force_new_actor:
+                vid_order = [v for v in vid_order if v in unmoved_actors]
 
             applied = False
-            applied_vid: str | None = None
-            applied_act: Action | None = None
             for try_vid in vid_order:
                 # Respect the quota: if we're forced to pick queried_vid,
                 # do not switch away from it just to satisfy anti-zigzag.
@@ -204,34 +719,212 @@ def generate_sequence(
                         and queried_move_count == 0
                         and try_vid != queried_vid):
                     continue
+                if force_nonqueried and try_vid == queried_vid:
+                    continue
+                if force_new_actor and try_vid not in unmoved_actors:
+                    continue
+                if (
+                    try_vid == queried_vid
+                    and queried_move_count >= max_queried_moves
+                    and not force_queried
+                ):
+                    continue
 
                 action_pool = list(valid_actions)
                 random.shuffle(action_pool)
+                if env == Environment.INTERSECTION and try_vid != queried_vid:
+                    # Keep STOP available (for distribution balance), but
+                    # still prefer moving traffic most of the time.
+                    if Action.STOP in action_pool:
+                        if (
+                            len(plan) >= 2
+                            and plan[-1][1] == Action.STOP
+                            and plan[-2][1] == Action.STOP
+                        ):
+                            # Avoid wasting trials on immediate STOP-streak dead ends.
+                            action_pool = [a for a in action_pool if a != Action.STOP] + [Action.STOP]
+                        elif random.random() < 0.18:
+                            action_pool = [Action.STOP] + [a for a in action_pool if a != Action.STOP]
+                        else:
+                            non_stop_actions = [a for a in action_pool if a != Action.STOP]
+                            if non_stop_actions:
+                                action_pool = non_stop_actions
+                if env == Environment.INTERSECTION and try_vid == queried_vid:
+                    queried_actions_so_far = [a for v_id, a in plan if v_id == queried_vid]
+                    q_left_including_this = min_queried_moves - len(queried_actions_so_far)
+                    q_pos = get_required_vehicle(trial_state, queried_vid).position
+                    if q_pos == "inside_intersection" and q_left_including_this <= 1:
+                        # Last queried move from inside should usually exit now.
+                        turn_actions = [a for a in action_pool if a in (Action.TURN_LEFT, Action.TURN_RIGHT)]
+                        if turn_actions:
+                            random.shuffle(turn_actions)
+                            action_pool = turn_actions + [a for a in action_pool if a not in turn_actions]
+                    # Encourage additional queried-action shapes beyond
+                    # MOVE_FORWARD->TURN_* without forcing them.
+                    if (
+                        not queried_actions_so_far
+                        and Action.STOP in action_pool
+                        and random.random() < 0.40
+                    ):
+                        action_pool = [Action.STOP] + [a for a in action_pool if a != Action.STOP]
+                    elif queried_actions_so_far == [Action.STOP] and Action.MOVE_FORWARD in action_pool:
+                        action_pool = [Action.MOVE_FORWARD] + [a for a in action_pool if a != Action.MOVE_FORWARD]
+                    elif (
+                        queried_actions_so_far == [Action.MOVE_FORWARD]
+                        and Action.STOP in action_pool
+                        and random.random() < 0.22
+                    ):
+                        action_pool = [Action.STOP] + [a for a in action_pool if a != Action.STOP]
+                if env == Environment.MULTI_LANE and try_vid == queried_vid:
+                    qacts = [a for v_id, a in plan if v_id == queried_vid]
+                    opposite = {
+                        Action.CHANGE_LEFT: Action.CHANGE_RIGHT,
+                        Action.CHANGE_RIGHT: Action.CHANGE_LEFT,
+                    }
+                    if qacts:
+                        prev = qacts[-1]
+                        if prev in opposite and opposite[prev] in action_pool:
+                            # Reduce repeated LL / RR collapses by preferring
+                            # the opposite lane change after a queried move.
+                            if (len(qacts) >= 2 and qacts[-1] == qacts[-2]) or random.random() < 0.60:
+                                pref = opposite[prev]
+                                action_pool = [pref] + [a for a in action_pool if a != pref]
                 for act in action_pool:
                     # 1. No consecutive identical (vehicle, action) pair.
                     if plan and plan[-1] == (try_vid, act):
                         continue
 
+                    # 1b. No mechanical A-B-A-B alternation over last 4 steps.
+                    if _would_create_abab_vehicle_pattern(plan, try_vid):
+                        continue
+
+                    # 1c. No monotone action streaks.
+                    if len(plan) >= 2 and plan[-1][1] == act and plan[-2][1] == act:
+                        continue
+
                     snapshot = copy.deepcopy(trial_state)
-                    result = safe_apply_action(snapshot, try_vid, act)
+                    result = _safe_apply_action_for_env(snapshot, try_vid, act, env)
                     if result is None:
                         continue
 
                     # 2. Anti-zigzag per vehicle.
                     new_pos = get_required_vehicle(snapshot, try_vid).position
                     history = pos_history[try_vid]
-                    if len(history) >= 2 and new_pos == history[-2]:
+                    # Allow one local reversal for diversity, but block
+                    # repetitive XYXY oscillations.
+                    if (
+                        len(history) >= 3
+                        and new_pos == history[-2]
+                        and history[-1] == history[-3]
+                    ):
                         continue
 
-                    # All soft constraints satisfied → commit the step.
-                    trial_state = snapshot
+                    # 2b. Optional cap on global explored positions
+                    # (used in multi-lane to keep 2 unvisited labels available
+                    # for highly_false distractors).
+                    if max_unique_positions is not None:
+                        unique_positions: set[str] = set()
+                        for v_id, h in pos_history.items():
+                            unique_positions.update(h)
+                            if v_id == try_vid:
+                                unique_positions.add(new_pos)
+                        if len(unique_positions) > max_unique_positions:
+                            continue
+
+                    if (
+                        choice_label_cap is not None
+                        and choice_label_vocab is not None
+                    ):
+                        covered_choice_labels: set[str] = set()
+                        for v_id, h in pos_history.items():
+                            for pos in h:
+                                lab = label_of(pos)
+                                if lab in choice_label_vocab:
+                                    covered_choice_labels.add(lab)
+                            if v_id == try_vid:
+                                lab = label_of(new_pos)
+                                if lab in choice_label_vocab:
+                                    covered_choice_labels.add(lab)
+                        if len(covered_choice_labels) > choice_label_cap:
+                            continue
+
+                    # All soft constraints satisfied → tentative step commit.
+                    # We append first so pattern guards evaluate the real
+                    # post-step suffix, then undo on early rejection.
                     plan.append((try_vid, act))
+
+                    # Early prune 1: action streak length-3.
+                    if len(plan) >= 3 and len({a for _, a in plan[-3:]}) == 1:
+                        plan.pop()
+                        continue
+
+                    # Early prune 2: A-B-A-B actor alternation on last 4 steps.
+                    if (
+                        len(plan) >= 4
+                        and plan[-1][0] == plan[-3][0]
+                        and plan[-2][0] == plan[-4][0]
+                        and plan[-1][0] != plan[-2][0]
+                    ):
+                        plan.pop()
+                        continue
+
+                    # Early prune 3: final-step action diversity feasibility.
+                    steps_remaining = n_steps - len(plan)
+                    if steps_remaining == 0 and len({a for _, a in plan}) < min_distinct_actions:
+                        plan.pop()
+                        continue
+
+                    # Early feasibility lookaheads for quota-style invariants.
+                    queried_after = queried_move_count + (1 if try_vid == queried_vid else 0)
+                    if queried_after > max_queried_moves:
+                        plan.pop()
+                        continue
+                    if queried_after + steps_remaining < min_queried_moves:
+                        plan.pop()
+                        continue
+
+                    nonqueried_after = sum(1 for v_id, _ in plan if v_id != queried_vid)
+                    if nonqueried_after + steps_remaining < min_nonqueried_moves:
+                        plan.pop()
+                        continue
+
+                    distinct_actors_after = {v_id for v_id, _ in plan}
+                    max_possible_distinct_actors = min(
+                        len(vehicle_ids),
+                        len(distinct_actors_after) + steps_remaining,
+                    )
+                    if max_possible_distinct_actors < min_distinct_actors:
+                        plan.pop()
+                        continue
+                    if max_possible_distinct_actors < min_vehicles_moved:
+                        plan.pop()
+                        continue
+
+                    distinct_actions_after = {a for _, a in plan}
+                    max_possible_distinct_actions = min(
+                        len(valid_actions),
+                        len(distinct_actions_after) + steps_remaining,
+                    )
+                    if max_possible_distinct_actions < min_distinct_actions:
+                        plan.pop()
+                        continue
+
+                    if require_other_vehicle_multi_step:
+                        other_counts: dict[str, int] = {}
+                        for v_id, _ in plan:
+                            if v_id == queried_vid:
+                                continue
+                            other_counts[v_id] = other_counts.get(v_id, 0) + 1
+                        best_other_after = max(other_counts.values(), default=0)
+                        if best_other_after < 2 and best_other_after + steps_remaining < 2:
+                            plan.pop()
+                            continue
+
+                    trial_state = snapshot
                     pos_history[try_vid].append(new_pos)
                     if try_vid == queried_vid:
                         queried_move_count += 1
                     applied = True
-                    applied_vid = try_vid
-                    applied_act = act
                     break
 
                 if applied:
@@ -245,8 +938,48 @@ def generate_sequence(
         if queried_move_count < min_queried_moves:
             continue
 
+        if queried_move_count > max_queried_moves:
+            continue
+
+        if _contains_abab_vehicle_pattern(plan):
+            continue
+
+        if _has_action_streak(plan, streak_len=3):
+            continue
+
+        if len({vid for vid, _ in plan}) < min_distinct_actors:
+            continue
+
+        if len({act for _, act in plan}) < min_distinct_actions:
+            continue
+
+        nonqueried_moves = sum(1 for vid, _ in plan if vid != queried_vid)
+        if nonqueried_moves < min_nonqueried_moves:
+            continue
+
+        moved_vehicles = {vid for vid, _ in plan}
+        if len(moved_vehicles) < min_vehicles_moved:
+            continue
+
+        if require_queried_interleaving and not _queried_moves_interleaved(plan, queried_vid):
+            continue
+
+        if require_other_vehicle_multi_step:
+            other_counts: dict[str, int] = {}
+            for vid, _ in plan:
+                if vid == queried_vid:
+                    continue
+                other_counts[vid] = other_counts.get(vid, 0) + 1
+            if not any(c >= 2 for c in other_counts.values()):
+                continue
+
+        if _has_vehicle_palindrome(plan):
+            continue
+
         final_pos = get_required_vehicle(trial_state, queried_vid).position
         if final_pos == start_pos:
+            continue
+        if env == Environment.INTERSECTION and final_pos == "inside_intersection":
             continue
 
         # Replay onto the caller's state so mutations stick.
@@ -263,7 +996,6 @@ def generate_sequence(
     return None
 
 
-# ── Per-vehicle trajectory replay ───────────────────────────────────────────
 
 def replay_trajectories(
     init_state: ScenarioState,
@@ -277,242 +1009,184 @@ def replay_trajectories(
     """
     sim = copy.deepcopy(init_state)
     trace: dict[str, list[str]] = {v.id: [v.position] for v in sim.vehicles}
+    env = sim.environment
 
     for vid, act in plan:
-        apply_action(sim, vid, act)
+        result = _safe_apply_action_for_env(sim, vid, act, env)
+        if not result:
+            raise RuntimeError(
+                f"replay_trajectories: FSM rejected planned action "
+                f"({vid}, {act}) — plan was not validated before replay."
+            )
         trace[vid].append(get_required_vehicle(sim, vid).position)
 
     return trace
 
 
-# ── Choice builder ──────────────────────────────────────────────────────────
 
 def build_choices(
     env: Environment,
     queried_vid: str,
     queried_trace: list[str],
     other_traces: dict[str, list[str]],
+    require_near_true_from_other: bool = False,
+    prefer_ambiguous_families: bool = False,
+    hf_label_usage: dict[str, int] | None = None,
+    hf_balance: dict[str, int] | None = None,
 ) -> dict[str, dict] | None:
     """
-    Build the 5-way MCQ choice set from real trajectory data.
-
-    Distractor hierarchy (Problem 4 of the Task 1 fix plan). Each slot
-    uses a fixed, prioritised list; the first candidate that yields a
-    valid same-environment label is accepted. If none of the tiers
-    yields a valid label, the whole example is rejected (return None)
-    — the caller must retry. No cross-environment fallback is ever used.
-
-    near_true  — plausible confusions:
-      near_true_1: queried vehicle's start position.
-                   rationale: "queried vehicle's start position"
-      near_true_2: (a) intermediate position visited by queried vehicle
-                   (b) final position of another vehicle in the scenario
-                   (c) any same-environment position not yet used
-
-    highly_false — implausible but same-environment:
-      highly_false_1: same-environment position never visited by ANY
-                      vehicle during the whole sequence.
-      highly_false_2: same-environment position not occupied by any
-                      vehicle at the end of the sequence (possibly
-                      visited mid-sequence).
-      If those same-environment pools are exhausted (multi_lane_road
-      has only 3 real lanes), both slots can fall back to the
-      HIGHLY_FALSE_LABELS_BY_ENV pool — same-domain labels that the
-      simulator never produces as a real position.
-
-    Returns the full 5-slot dict, or None on vocabulary exhaustion.
+    Build 5-way MCQ with closed state-space logic:
+      • near_true  = visited states (queried/other trajectories)
+      • highly_false = reachable env states never visited
     """
-    # ── correct ─────────────────────────────────────────────────────────
-    correct_pos   = queried_trace[-1]
-    correct_label = label_of(correct_pos)
-
-    # ── near_true_1 ────────────────────────────────────────────────────
-    start_pos = queried_trace[0]
-    nt1_label = label_of(start_pos)
-    if nt1_label == correct_label:
-        # generate_sequence guarantees start ≠ final, so this is
-        # defensive — just in case.
+    correct_label = label_of(queried_trace[-1])
+    env_labels = _choice_labels_for_env(env)
+    env_label_set = set(env_labels)
+    if correct_label not in env_label_set:
         return None
-    nt1_rationale = "queried vehicle's start position"
+    if env == Environment.INTERSECTION and correct_label == "inside the intersection":
+        return None
 
-    used: set[str] = {correct_label, nt1_label}
-    
+    visited_labels: set[str] = {
+        label_of(pos)
+        for trace in other_traces.values()
+        for pos in trace
+    }
 
-# --- Reachability helpers for stronger near_true / highly_false (MULTI_LANE) ---
+    # near_true candidates (visited != correct), with provenance.
+    start_label = label_of(queried_trace[0])
+    nt_candidates: list[dict[str, str | int]] = []
+    if start_label != correct_label and start_label in env_label_set:
+        nt_candidates.append({
+            "label": start_label,
+            "rationale": "queried vehicle's start position",
+            "source": "queried_start",
+            "weight": 4,
+        })
+    for pos in queried_trace[1:-1]:
+        lab = label_of(pos)
+        if lab == correct_label or lab not in env_label_set:
+            continue
+        nt_candidates.append({
+            "label": lab,
+            "rationale": "intermediate position visited by queried vehicle",
+            "source": "queried_intermediate",
+            "weight": 5,
+        })
 
-    queried_start_pos = queried_trace[0]
-    queried_move_budget = max(0, len(queried_trace) - 1)
-    def _reachable_labels_for_queried(
-        env_: Environment,
-        start_pos_: str,
-        move_budget_: int,
-    ) -> set[str]:
-        if move_budget_ <= 0:
-            return {label_of(start_pos_)}
-        if env_ == Environment.MULTI_LANE and start_pos_ in LANE_ORDER:
-            start_idx = LANE_ORDER.index(start_pos_)
-            idxs = {start_idx}
-            frontier = {start_idx}
-            for _ in range(move_budget_):
-                nxt: set[int] = set()
-                for i in frontier:
-                    if i - 1 >= 0:
-                        nxt.add(i - 1)
-                    if i + 1 < len(LANE_ORDER):
-                        nxt.add(i + 1)
-                idxs |= nxt
-                frontier = nxt
-            return {label_of(LANE_ORDER[i]) for i in idxs}
-        return {label_of(start_pos_)}
-    reachable_by_queried = _reachable_labels_for_queried(
-        env, queried_start_pos, queried_move_budget
+    for vid, trace in other_traces.items():
+        if vid == queried_vid:
+            continue
+        for i, pos in enumerate(trace):
+            lab = label_of(pos)
+            if lab == correct_label or lab not in env_label_set:
+                continue
+            if i == len(trace) - 1:
+                nt_candidates.append({
+                    "label": lab,
+                    "rationale": f"final position of vehicle {vid}",
+                    "source": "other_final",
+                    "weight": 4,
+                })
+            else:
+                nt_candidates.append({
+                    "label": lab,
+                    "rationale": "position visited by another vehicle",
+                    "source": "other_visited",
+                    "weight": 3,
+                })
 
-    )
+    # Deduplicate near_true by label (keep strongest weight).
+    nt_by_label: dict[str, dict[str, str | int]] = {}
+    for cand in nt_candidates:
+        lab = str(cand["label"])
+        if lab not in nt_by_label or int(cand["weight"]) > int(nt_by_label[lab]["weight"]):
+            nt_by_label[lab] = cand
+    nt_pool = list(nt_by_label.values())
+    if len(nt_pool) < 2:
+        return None
 
+    selected_nt: list[dict[str, str | int]] = []
+    while len(selected_nt) < 2:
+        remain = [c for c in nt_pool if c["label"] not in {s["label"] for s in selected_nt}]
+        if not remain:
+            return None
+        pick = random.choices(
+            remain,
+            weights=[int(c["weight"]) for c in remain],
+            k=1,
+        )[0]
+        selected_nt.append(pick)
 
-
-    # ── near_true_2: prioritised tiers ─────────────────────────────────
-    # Tier a — intermediate position visited by the queried vehicle.
-    nt2_label: str | None = None
-    nt2_rationale: str | None = None
-
-    if len(queried_trace) > 2:
-        intermediates = [
-            label_of(p) for p in queried_trace[1:-1]
-            if label_of(p) not in used
+    if require_near_true_from_other and not any(
+        str(c["source"]).startswith("other_") for c in selected_nt
+    ):
+        other_pool = [c for c in nt_pool if str(c["source"]).startswith("other_")]
+        if not other_pool:
+            return None
+        # replace second slot to force cross-vehicle tracking ambiguity
+        replacement_pool = [
+            c for c in other_pool
+            if c["label"] != selected_nt[0]["label"]
         ]
-        if intermediates:
-            nt2_label = random.choice(intermediates)
-            nt2_rationale = "intermediate position visited by queried vehicle"
+        if not replacement_pool:
+            return None
+        repl = random.choice(replacement_pool)
+        selected_nt[1] = repl
 
-    # Tier b — final position of another vehicle in the scenario.
-    if nt2_label is None:
-        other_ids = [vid for vid in other_traces if vid != queried_vid]
-        random.shuffle(other_ids)
-        for other_id in other_ids:
-            candidate = label_of(other_traces[other_id][-1])
-            if candidate not in used:
-                nt2_label = candidate
-                nt2_rationale = f"final position of vehicle {other_id}"
+    nt1_label = str(selected_nt[0]["label"])
+    nt1_rationale = str(selected_nt[0]["rationale"])
+    nt2_label = str(selected_nt[1]["label"])
+    nt2_rationale = str(selected_nt[1]["rationale"])
+
+    used = {correct_label, nt1_label, nt2_label}
+
+    hf_pool = [lab for lab in env_labels if lab not in visited_labels and lab not in used]
+    if len(hf_pool) < 2:
+        return None
+
+    def _pick_hf_pair() -> tuple[str, str]:
+        if prefer_ambiguous_families:
+            same_family = [lab for lab in hf_pool if _label_family(lab) == _label_family(correct_label)]
+            if len(same_family) >= 1:
+                same_weights = [_hf_weight(lab, env, hf_label_usage) for lab in same_family]
+                hf1 = _weighted_label_pick(same_family, same_weights)
+                rem = [lab for lab in hf_pool if lab != hf1]
+                rem_same = [lab for lab in rem if _label_family(lab) == _label_family(correct_label)]
+                source = rem_same if rem_same else rem
+                src_weights = [_hf_weight(lab, env, hf_label_usage) for lab in source]
+                hf2 = _weighted_label_pick(source, src_weights)
+                return hf1, hf2
+            hf_weights = [_hf_weight(lab, env, hf_label_usage) for lab in hf_pool]
+            return _weighted_pick_two_distinct(hf_pool, hf_weights)
+        hf_weights = [_hf_weight(lab, env, hf_label_usage) for lab in hf_pool]
+        return _weighted_pick_two_distinct(hf_pool, hf_weights)
+
+    hf1_label, hf2_label = _pick_hf_pair()
+    # Soft shoulder cap: resample HF pair instead of rejecting whole example.
+    if env == Environment.MULTI_LANE and hf_balance is not None:
+        shoulder_hf_now = int(hf_balance.get("multi_lane_hf_shoulder_total", 0))
+        hf_total_now = int(hf_balance.get("multi_lane_hf_total", 0))
+        non_shoulder_pool = [lab for lab in hf_pool if not _is_shoulder_label(lab)]
+        for _ in range(12):
+            shoulder_in_pair = int(_is_shoulder_label(hf1_label)) + int(_is_shoulder_label(hf2_label))
+            next_ratio = (shoulder_hf_now + shoulder_in_pair) / max(1, hf_total_now + 2)
+            if next_ratio <= MULTI_LANE_HF_SHOULDER_RATIO_CAP:
                 break
+            if len(non_shoulder_pool) >= 2:
+                hf_weights = [_hf_weight(lab, env, hf_label_usage) for lab in non_shoulder_pool]
+                hf1_label, hf2_label = _weighted_pick_two_distinct(non_shoulder_pool, hf_weights)
+                continue
+            if len(non_shoulder_pool) == 1:
+                hf1_label = non_shoulder_pool[0]
+                rem = [lab for lab in hf_pool if lab != hf1_label]
+                rem_weights = [_hf_weight(lab, env, hf_label_usage) for lab in rem]
+                hf2_label = _weighted_label_pick(rem, rem_weights)
+                continue
+            hf1_label, hf2_label = _pick_hf_pair()
 
-    # Tier c — any same-environment position not yet used.
-    if nt2_label is None:
-        pool = [lab for lab in labels_for_env(env) if lab not in used]
-        if pool:
-            nt2_label = random.choice(pool)
-            nt2_rationale = "same-environment position"
-
-    if nt2_label is None:
-        return None
-    used.add(nt2_label)
-
-    # ── highly_false_1: same-env position NEVER visited by any vehicle ──
-    visited_labels: set[str] = set()
-    for p in queried_trace:
-        visited_labels.add(label_of(p))
-    for vid, trace in other_traces.items():
-        for p in trace:
-            visited_labels.add(label_of(p))
-
-    never_visited_pool = [
-        lab for lab in labels_for_env(env)
-        if lab not in visited_labels and lab not in used
-    ]
-
-    hf1_label: str | None = None
-    hf1_rationale: str | None = None
-# MULTI_LANE hardness upgrade: prefer realistic-but-unreachable lane labels
-# (given the queried vehicle's move budget) over road-context decoys.
-    lane_labels = {label_of(p) for p in LANE_ORDER}
-    unreachable_realistic_lane_pool: list[str] = []
-    if env == Environment.MULTI_LANE and queried_trace and queried_trace[0] in LANE_ORDER:
-        unreachable_realistic_lane_pool = [
-           lab for lab in lane_labels
-           if lab not in reachable_by_queried and lab not in used
-    ]
-
-    hf1_label: str | None = None
-    hf1_rationale: str | None = None
-
-    if unreachable_realistic_lane_pool:
-        hf1_label = random.choice(unreachable_realistic_lane_pool)
-        hf1_rationale = (
-            "realistic lane unreachable by queried vehicle within its move budget"
-        )
-    elif never_visited_pool:
-
-    # In MULTI_LANE, prefer lane-position distractors over obvious
-    # road-context labels (shoulder/median/oncoming/etc.).
-        if env == Environment.MULTI_LANE:
-            lane_pref = [lab for lab in never_visited_pool if lab in lane_labels]
-            pool = lane_pref if lane_pref else never_visited_pool
-        else:
-            pool = never_visited_pool
-        hf1_label = random.choice(pool)
-        hf1_rationale = "same-environment position never visited by any vehicle"
-    else:
-        # Same-environment exhaustion → dedicated highly_false pool.
-        # Keep road-context decoys as rare fallback.
-        hf_pool = [
-            lab for lab in highly_false_labels_for_env(env)
-            if lab not in used
-        ]
-        if hf_pool:
-            hf1_label = random.choice(hf_pool)
-            hf1_rationale = "road-context position not reachable in simulation"
-    #--------------
-
-    if hf1_label is None:
-        return None
-    used.add(hf1_label)
-
-    # ── highly_false_2: same-env position not occupied AT END ───────────
-    end_occupied: set[str] = {label_of(queried_trace[-1])}
-    for vid, trace in other_traces.items():
-        end_occupied.add(label_of(trace[-1]))
-
-    not_end_pool = [
-        lab for lab in labels_for_env(env)
-        if lab not in end_occupied and lab not in used
-    ]
-
-    hf2_label: str | None = None
-    hf2_rationale: str | None = None
-    unreachable_realistic_lane_pool_2: list[str] = []
-    if env == Environment.MULTI_LANE and queried_start_pos in LANE_ORDER:
-        unreachable_realistic_lane_pool_2 = [
-            lab for lab in lane_labels
-            if lab not in reachable_by_queried
-            and lab not in used
-            and lab not in end_occupied
-        ]
-
-    if unreachable_realistic_lane_pool_2:
-        hf2_label = random.choice(unreachable_realistic_lane_pool_2)
-        hf2_rationale = (
-            "realistic lane unreachable by queried vehicle within its move budget"
-        )
-    elif not_end_pool:
-        if env == Environment.MULTI_LANE:
-            lane_pref = [lab for lab in not_end_pool if lab in lane_labels]
-            pool = lane_pref if lane_pref else not_end_pool
-        else:
-            pool = not_end_pool
-        hf2_label = random.choice(pool)
-        hf2_rationale = "same-environment position not occupied at end of sequence"
-    else:
-        hf_pool = [
-            lab for lab in highly_false_labels_for_env(env)
-            if lab not in used
-        ]
-        if hf_pool:
-            hf2_label = random.choice(hf_pool)
-            hf2_rationale = "road-context position not reachable in simulation"
-    #----       
-
-    if hf2_label is None:
-        return None
+    hf1_rationale = "reachable same-environment state never visited by any vehicle"
+    hf2_rationale = "reachable same-environment state never visited by any vehicle"
 
     return {
         "correct": {
@@ -543,7 +1217,6 @@ def build_choices(
     }
 
 
-# ── Letter assignment ───────────────────────────────────────────────────────
 
 LETTERS = ["A", "B", "C", "D", "E"]
 
@@ -552,16 +1225,7 @@ def assign_letters(
     choices_dict: dict[str, dict],
     correct_key: str,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str], str]:
-    """
-    Shuffles the five options and places the correct answer at *correct_key*.
-
-    Returns:
-        choices           – dict  {A..E: text}
-        distractor_type   – dict  {A..E: type}  (only for distractors)
-        rationale_by_letter – dict {A..E: rationale} (for ALL options,
-                                including the correct one)
-        answer            – the letter of the correct answer
-    """
+    """Shuffle options and place the correct answer at `correct_key`."""
     items = list(choices_dict.values())
     random.shuffle(items)
 
@@ -582,16 +1246,16 @@ def assign_letters(
     return choices, distractor_type, rationale_by_letter, correct_key
 
 
-# ── Event rendering from plan ───────────────────────────────────────────────
 
 def plan_to_events(
     init_state: ScenarioState, plan: list[tuple[str, Action]]
 ) -> list[str]:
     """Replays `plan` to produce the human-readable event strings."""
     sim = copy.deepcopy(init_state)
+    env = sim.environment
     events: list[str] = []
     for vid, act in plan:
-        ev = apply_action(sim, vid, act)
+        ev = _safe_apply_action_for_env(sim, vid, act, env)
         if not ev:
             raise RuntimeError(
                 f"Planned action rejected by FSM at replay: ({vid}, {act})."
@@ -600,7 +1264,6 @@ def plan_to_events(
     return events
 
 
-# ── Validation gate (Problems 2 & 6) ─────────────────────────────────────────
 
 def validate_example(
     example: dict,
@@ -608,19 +1271,18 @@ def validate_example(
     plan: list[tuple[str, Action]],
     env: Environment,
     queried_vid: str,
+    difficulty_profile: dict,
 ) -> tuple[bool, str]:
     """
-    Hard quality gate applied to every candidate example before it is
-    appended to the dataset. Implements both the Problem 2 validation
-    contract and the Problem 6 distractor quality gate.
+    Runs per-example checks before appending to the dataset.
+    Covers Problems 2 and 6 from the T1 fix plan.
 
-    Returns (ok, reason). When ok is False, `reason` is a short string
-    naming the failing check — generate_example() will treat it as a
-    rejection and retry.
+    Returns (ok, reason). When ok is False, `reason` names the failing
+    check — generate_example() treats it as a rejection and retries.
 
     Checks:
-      V1. All 5 choice texts belong to the same-environment controlled
-          vocabulary (real position labels ∪ HIGHLY_FALSE_LABELS_BY_ENV).
+      V1. All 5 choice texts belong to the same-environment state space
+          (reachable position labels only).
       V2. All 5 choice texts are pairwise distinct.
       V3. The correct answer text matches the replay-simulated final
           position of the queried vehicle (replay from init_state).
@@ -628,6 +1290,17 @@ def validate_example(
       V5. start_position != final_position for the queried vehicle.
       V6. Exactly 2 distractors typed `near_true` and exactly 2 typed
           `highly_false`.
+      V7. Queried vehicle meets the profile move quota.
+      V8. The replay of every planned action must be FSM-valid.
+      V9. No A-B-A-B vehicle alternation and no consecutive identical
+          (vehicle, action) pairs.
+      V10. At least 2 distinct acting vehicles and 2 distinct action types.
+      V11. near_true distractors must be labels visited in scenario traces.
+      V12. Audit fields (plan / traces / rationale map) are internally
+           consistent with reconstructed trajectories.
+      V13. Options should resist trivial elimination shortcuts:
+           all 5 options must stay in closed state-space and at least one
+           distractor must share label-family with the correct option.
     """
     choices = example["choices"]
     answer_letter = example["answer"]
@@ -635,7 +1308,7 @@ def validate_example(
 
     # V1 — environment consistency
     for letter, text in choices.items():
-        if not is_env_consistent_label(text, env):
+        if not is_valid_label(text, env):
             return False, f"choice {letter} {text!r} not env-consistent for {env.value}"
 
     # V2 — pairwise distinct
@@ -644,8 +1317,14 @@ def validate_example(
 
     # V3 — correct answer matches independent replay
     replay = copy.deepcopy(init_state)
+    replay_trace: dict[str, list[str]] = {
+        v.id: [v.position] for v in replay.vehicles
+    }
     for vid, act in plan:
-        apply_action(replay, vid, act)
+        ev = _safe_apply_action_for_env(replay, vid, act, env)
+        if not ev:
+            return False, f"invalid planned transition during replay: ({vid}, {act})"
+        replay_trace[vid].append(get_required_vehicle(replay, vid).position)
     final_pos = get_required_vehicle(replay, queried_vid).position
     if label_of(final_pos) != correct_text:
         return False, (
@@ -672,64 +1351,344 @@ def validate_example(
     if nt != 2 or hf != 2:
         return False, f"distractor type counts {nt=} {hf=} (expected 2/2)"
 
+    # V7 — queried vehicle multi-step quota from profile
+    queried_moves = sum(1 for vid, _ in plan if vid == queried_vid)
+    target_from_audit = (
+        example.get("audit", {})
+        .get("profile_constraints", {})
+        .get("target_queried_moves")
+    )
+    if isinstance(target_from_audit, int):
+        if not (
+            difficulty_profile["min_queried_moves"]
+            <= target_from_audit
+            <= difficulty_profile["max_queried_moves"]
+        ):
+            return False, "audit target_queried_moves outside difficulty bounds"
+        if queried_moves != target_from_audit:
+            return False, (
+                f"queried vehicle moved {queried_moves}, expected exact target "
+                f"{target_from_audit}"
+            )
+    elif queried_moves < difficulty_profile["min_queried_moves"]:
+        return False, (
+            f"queried vehicle moved {queried_moves}, expected at least "
+            f"{difficulty_profile['min_queried_moves']}"
+        )
+    if queried_moves > difficulty_profile["max_queried_moves"]:
+        return False, (
+            f"queried vehicle moved {queried_moves}, expected at most "
+            f"{difficulty_profile['max_queried_moves']}"
+        )
+
+    # V9 — sequence anti-mechanical checks
+    if _contains_abab_vehicle_pattern(plan):
+        return False, "plan contains A-B-A-B vehicle alternation"
+    for idx in range(len(plan) - 1):
+        if plan[idx] == plan[idx + 1]:
+            return False, f"plan repeats identical pair at step {idx + 1}"
+
+    # V10 — minimum actor/action diversity
+    if len({vid for vid, _ in plan}) < difficulty_profile["min_distinct_actors"]:
+        return False, "plan has insufficient acting-vehicle diversity"
+    if len({act for _, act in plan}) < difficulty_profile["min_distinct_actions"]:
+        return False, "plan has insufficient action diversity"
+    nonqueried_moves = sum(1 for vid, _ in plan if vid != queried_vid)
+    if nonqueried_moves < difficulty_profile["min_nonqueried_moves"]:
+        return False, "insufficient non-queried interaction"
+    if len({vid for vid, _ in plan}) < difficulty_profile["min_vehicles_moved"]:
+        return False, "too few vehicles moved"
+    if difficulty_profile["require_queried_interleaving"]:
+        if not _queried_moves_interleaved(plan, queried_vid):
+            return False, "queried moves not interleaved with other vehicles"
+
+    if difficulty_profile["require_other_vehicle_multi_step"]:
+        other_counts: dict[str, int] = {}
+        for vid, _ in plan:
+            if vid == queried_vid:
+                continue
+            other_counts[vid] = other_counts.get(vid, 0) + 1
+        if not any(c >= 2 for c in other_counts.values()):
+            return False, "no non-queried vehicle with multi-step trajectory"
+
+    if _has_vehicle_palindrome(plan):
+        return False, "plan has symmetric palindrome actor pattern"
+
+    if _has_action_streak(plan, streak_len=3):
+        return False, "plan has action streak of length 3"
+
+    # V11 — near_true choices must be grounded in visited states
+    audit = example.get("audit", {})
+    visited_labels = {
+        label_of(pos)
+        for t in replay_trace.values()
+        for pos in t
+    }
+    for letter, dty in dtypes.items():
+        if dty == "near_true" and choices[letter] not in visited_labels:
+            return False, f"near_true option {letter} is not visited in trace"
+    if difficulty_profile["require_near_true_from_other"]:
+        rationale_by_letter = audit.get("rationale_by_letter", {})
+        near_true_reasons = [
+            rationale_by_letter.get(letter, "")
+            for letter, dty in dtypes.items()
+            if dty == "near_true"
+        ]
+        if not any(
+            ("another vehicle" in r) or ("final position of vehicle" in r)
+            for r in near_true_reasons
+        ):
+            return False, "near_true set lacks other-vehicle grounded distractor"
+
+    # V12 — audit consistency
+    if audit.get("queried_trace") != replay_trace.get(queried_vid):
+        return False, "audit queried_trace mismatch"
+    if audit.get("all_traces") != replay_trace:
+        return False, "audit all_traces mismatch"
+    expected_plan_audit = [[vid, act.name] for vid, act in plan]
+    if audit.get("plan") != expected_plan_audit:
+        return False, "audit plan mismatch"
+    expected_qshape = [act.name for vid, act in plan if vid == queried_vid]
+    if audit.get("queried_action_shape") != expected_qshape:
+        return False, "audit queried_action_shape mismatch"
+    rationale_by_letter = audit.get("rationale_by_letter", {})
+    if set(rationale_by_letter.keys()) != set(LETTERS):
+        return False, "audit rationale_by_letter does not cover A..E"
+
+    # V13 — anti-shortcut option checks
+    real_env_count = sum(1 for text in choices.values() if is_valid_label(text, env))
+    if real_env_count != 5:
+        return False, "non-closed-set label detected in choices"
+    correct_family = _label_family(correct_text)
+    family_domain_count = sum(
+        1 for label in labels_for_env(env)
+        if _label_family(label) == correct_family
+    )
+    family_distractors = sum(
+        1
+        for letter, text in choices.items()
+        if letter != answer_letter and _label_family(text) == correct_family
+    )
+    if family_domain_count >= 2 and family_distractors < 1:
+        return False, "correct label-family is uniquely identifiable"
+    if difficulty_profile["prefer_ambiguous_families"] and family_domain_count >= 2:
+        near_true_same_family = sum(
+            1
+            for letter, dty in dtypes.items()
+            if dty == "near_true" and _label_family(choices[letter]) == correct_family
+        )
+        highly_false_same_family = sum(
+            1
+            for letter, dty in dtypes.items()
+            if dty == "highly_false" and _label_family(choices[letter]) == correct_family
+        )
+        if near_true_same_family < 1 or highly_false_same_family < 1:
+            return False, "hard profile lacks family-level distractor ambiguity"
+
     return True, "ok"
 
 
-# ── Single example generator ────────────────────────────────────────────────
 
 def generate_example(
     example_id: int,
     correct_key: str,
+    difficulty_hint: str | None = None,
     env_hint: Environment | None = None,
+    quality_tracker: dict | None = None,
+    reject_stats: dict[str, int] | None = None,
 ) -> dict | None:
-    """
-    Generates a single Task 1 example. Returns None if no valid sequence
-    and a valid 5-way choice set can be produced within MAX_RETRIES.
-
-    Args:
-        example_id:   running index for the example id.
-        correct_key:  letter (A..E) where the correct answer must land.
-        env_hint:     if set, restrict generation to this environment
-                      (used by the key_schedule to keep env balance).
-    """
+    """Build one Task 1 example, or None if retries are exhausted."""
     for attempt in range(MAX_RETRIES):
-        env = env_hint if env_hint is not None else random.choice(TASK_ENVS)
-        n_steps = random.randint(MIN_STEPS, MAX_STEPS)
+        difficulty = difficulty_hint if difficulty_hint in DIFFICULTIES else random.choice(DIFFICULTIES)
+        base_profile = _difficulty_profile(difficulty)
+        allowed_envs = base_profile["allowed_envs"]
+        if env_hint is not None and env_hint in allowed_envs:
+            env = env_hint
+        else:
+            env = random.choice(allowed_envs)
+        profile = _profile_for_env(base_profile, env, difficulty)
+        min_total_steps = profile["min_queried_moves"] + profile["min_nonqueried_moves"]
+        step_low = max(profile["step_min"], min_total_steps)
+        step_high = profile["step_max"]
+        if step_low > step_high:
+            _inc(reject_stats, "reject.step_bounds")
+            continue
+        n_steps = random.randint(step_low, step_high)
 
         if env == Environment.MULTI_LANE:
-            state = build_multi_lane_scenario(NUM_VEHICLES)
+            state = _build_multi_lane_scenario(
+                NUM_VEHICLES,
+                compact_starts=(difficulty == "hard"),
+            )
         else:
-            state = build_intersection_scenario(NUM_VEHICLES, with_intent=False)
+            state = _build_intersection_scenario_task1(NUM_VEHICLES)
 
-        queried_vid = random.choice([v.id for v in state.vehicles])
-        init_state = copy.deepcopy(state)
-
-        sim_state = copy.deepcopy(state)
-        plan = generate_sequence(sim_state, queried_vid, env, n_steps)
-        if plan is None:
+        max_env_qmoves = MAX_QUERIED_MOVES_BY_ENV.get(env, n_steps)
+        interleave_cap = (
+            (n_steps + 1) // 2
+            if profile["require_queried_interleaving"]
+            else n_steps
+        )
+        max_feasible_qmoves = min(
+            profile["max_queried_moves"],
+            max_env_qmoves,
+            n_steps - profile["min_nonqueried_moves"],
+            interleave_cap,
+        )
+        min_feasible_qmoves = profile["min_queried_moves"]
+        if max_feasible_qmoves < min_feasible_qmoves:
             continue
+        feasible_qmoves = list(range(min_feasible_qmoves, max_feasible_qmoves + 1))
+        if quality_tracker is not None:
+            if env == Environment.MULTI_LANE:
+                if difficulty == "easy":
+                    base_pref = {1: 1.20, 2: 1.00, 3: 0.50, 4: 0.10}
+                elif difficulty == "medium":
+                    base_pref = {1: 0.60, 2: 1.00, 3: 1.15, 4: 0.40}
+                else:
+                    # Hard multi-lane stays multi-step, but over-sampling
+                    # 3 queried moves creates many dead-end plans.
+                    base_pref = {1: 0.10, 2: 1.60, 3: 0.45, 4: 0.15}
+                q_usage = quality_tracker.get("multi_lane_queried_move_counts", {})
+                q_weights = [
+                    base_pref.get(m, 1.0) / (1.0 + q_usage.get(m, 0))
+                    for m in feasible_qmoves
+                ]
+                target_qmoves = random.choices(feasible_qmoves, weights=q_weights, k=1)[0]
+            else:
+                if difficulty == "easy":
+                    base_pref = {2: 1.00}
+                elif difficulty == "medium":
+                    base_pref = {2: 1.00}
+                else:
+                    base_pref = {2: 1.00}
+                q_usage = quality_tracker.get("intersection_queried_move_counts", {})
+                q_weights = [
+                    base_pref.get(m, 1.0) / (1.0 + q_usage.get(m, 0))
+                    for m in feasible_qmoves
+                ]
+                target_qmoves = random.choices(feasible_qmoves, weights=q_weights, k=1)[0]
+        else:
+            target_qmoves = random.choice(feasible_qmoves)
+        seq_min_nonqueried_moves = profile["min_nonqueried_moves"]
+        seq_min_vehicles_moved = profile["min_vehicles_moved"]
+        seq_min_distinct_actions = profile["min_distinct_actions"]
+        seq_require_other_vehicle_multi_step = profile["require_other_vehicle_multi_step"]
 
-        events = plan_to_events(init_state, plan)
-        trace  = replay_trajectories(init_state, plan)
+        init_state = copy.deepcopy(state)
+        queried_vid: str | None = None
+        plan: list[tuple[str, Action]] | None = None
+        events: list[str] | None = None
+        trace: dict[str, list[str]] | None = None
+        visited_labels: set[str] | None = None
+        for _ in range(SEQUENCE_TRIES_PER_ATTEMPT):
+            if env == Environment.INTERSECTION:
+                inside_candidates = [
+                    v.id for v in state.vehicles
+                    if v.position == "inside_intersection"
+                ]
+                if inside_candidates and random.random() < INTERSECTION_INSIDE_QUERY_BIAS:
+                    try_queried_vid = random.choice(inside_candidates)
+                else:
+                    try_queried_vid = random.choice([v.id for v in state.vehicles])
+            else:
+                try_queried_vid = random.choice([v.id for v in state.vehicles])
+
+            sim_state = copy.deepcopy(state)
+            try_plan = generate_sequence(
+                sim_state,
+                try_queried_vid,
+                env,
+                n_steps,
+                min_queried_moves=target_qmoves,
+                max_queried_moves=target_qmoves,
+                min_distinct_actors=profile["min_distinct_actors"],
+                min_distinct_actions=seq_min_distinct_actions,
+                min_nonqueried_moves=seq_min_nonqueried_moves,
+                min_vehicles_moved=seq_min_vehicles_moved,
+                require_queried_interleaving=profile["require_queried_interleaving"],
+                require_other_vehicle_multi_step=seq_require_other_vehicle_multi_step,
+                max_unique_positions=(4 if env == Environment.MULTI_LANE else None),
+                choice_label_cap=(3 if env == Environment.INTERSECTION else None),
+                choice_label_vocab=(
+                    set(INTERSECTION_ALLOWED_CHOICE_LABELS)
+                    if env == Environment.INTERSECTION
+                    else None
+                ),
+            )
+            if try_plan is None:
+                continue
+
+            try_events = plan_to_events(init_state, try_plan)
+            try_trace = replay_trajectories(init_state, try_plan)
+            try_visited_labels = {
+                label_of(pos)
+                for t in try_trace.values()
+                for pos in t
+            }
+            if env == Environment.INTERSECTION:
+                covered_choice_labels = {
+                    lab for lab in try_visited_labels
+                    if lab in INTERSECTION_ALLOWED_CHOICE_LABELS
+                }
+                if len(covered_choice_labels) < 3:
+                    _inc(reject_stats, "reject.intersection.choice_coverage_low")
+                    continue
+
+            queried_vid = try_queried_vid
+            plan = try_plan
+            events = try_events
+            trace = try_trace
+            visited_labels = try_visited_labels
+            break
+        if plan is None:
+            _inc(reject_stats, f"reject.sequence.{env.value}")
+            continue
+        assert queried_vid is not None
+        assert events is not None
+        assert trace is not None
+        assert visited_labels is not None
 
         queried_trace = trace[queried_vid]
-        raw_choices = build_choices(env, queried_vid, queried_trace, trace)
+        raw_choices = None
+        for _ in range(CHOICE_RETRIES_PER_PLAN):
+            raw_choices = build_choices(
+                env,
+                queried_vid,
+                queried_trace,
+                trace,
+                require_near_true_from_other=profile["require_near_true_from_other"],
+                prefer_ambiguous_families=profile["prefer_ambiguous_families"],
+                hf_label_usage=(
+                    quality_tracker.get("multi_lane_hf_label_counts")
+                    if (quality_tracker is not None and env == Environment.MULTI_LANE)
+                    else None
+                ),
+                hf_balance=(
+                    quality_tracker if (quality_tracker is not None and env == Environment.MULTI_LANE) else None
+                ),
+            )
+            if raw_choices is not None:
+                break
         if raw_choices is None:
+            _inc(reject_stats, f"reject.choices.{env.value}")
             continue  # vocabulary exhaustion → retry
 
-        # Post-condition: all five labels are distinct and valid for env
-        # (cross-env hf is intentionally NOT valid for env — that's its role).
+        # Post-condition: all five labels are pairwise distinct.
+        # Environment consistency is enforced by validate_example().
         letter_texts = {c["text"] for c in raw_choices.values()}
         if len(letter_texts) != 5:
+            _inc(reject_stats, "reject.choices.not_unique")
             continue
 
         choices, distractor_type, rationale_by_letter, answer = assign_letters(
             raw_choices, correct_key
         )
-
-        scenario_text = describe_scenario(init_state)
-        question = f"Where is Vehicle {queried_vid} at the end of the sequence?"
-        prompt = render_prompt(scenario_text, events, question, choices)
+        scenario_text = _describe_task1_scenario(init_state)
+        question = _pick_question(queried_vid)
+        prompt, event_header_used, question_header_used = _render_prompt_with_variation(
+            scenario_text, events, question, choices
+        )
 
         example = {
             "id": f"task1_{example_id:04d}",
@@ -741,6 +1700,7 @@ def generate_example(
                         "id": v.id,
                         "position": v.position,
                         "direction": v.direction.value,
+                        "inside_intersection": v.inside_intersection,
                     }
                     for v in init_state.vehicles
                 ],
@@ -756,25 +1716,66 @@ def generate_example(
                 "num_events": len(events),
                 "queried_vehicle": queried_vid,
                 "environment": env.value,
-                "difficulty": "base",
+                "difficulty": difficulty,
             },
             "audit": {
                 "generator_version": GENERATOR_VERSION,
                 "attempt": attempt,
+                "difficulty_profile": difficulty,
+                "profile_constraints": {
+                    "min_queried_moves": profile["min_queried_moves"],
+                    "max_queried_moves": profile["max_queried_moves"],
+                    "target_queried_moves": target_qmoves,
+                    "min_distinct_actors": profile["min_distinct_actors"],
+                    "min_distinct_actions": profile["min_distinct_actions"],
+                    "min_nonqueried_moves": profile["min_nonqueried_moves"],
+                    "min_vehicles_moved": profile["min_vehicles_moved"],
+                    "require_queried_interleaving": profile["require_queried_interleaving"],
+                    "require_near_true_from_other": profile["require_near_true_from_other"],
+                    "require_other_vehicle_multi_step": profile["require_other_vehicle_multi_step"],
+                    "prefer_ambiguous_families": profile["prefer_ambiguous_families"],
+                },
+                "prompt_style": {
+                    "event_header": event_header_used,
+                    "question_header": question_header_used,
+                },
                 "queried_trace": queried_trace,
+                "queried_action_shape": [act.name for vid, act in plan if vid == queried_vid],
                 "all_traces": trace,
                 "plan": [[vid, act.name] for vid, act in plan],
                 "rationale_by_letter": rationale_by_letter,
                 "invariants": {
                     "start_ne_final": queried_trace[0] != queried_trace[-1],
                     "queried_moved": sum(1 for vid, _ in plan if vid == queried_vid),
-                    # Problem 3 — strict per-environment vocabulary check:
-                    # every option must be a real position label for `env`
-                    # or belong to the dedicated highly_false pool for `env`.
-                    # Cross-environment labels are rejected.
+                    "no_abab_vehicle_pattern": not _contains_abab_vehicle_pattern(plan),
+                    "plan_actor_diversity_ok": (
+                        len({vid for vid, _ in plan}) >= profile["min_distinct_actors"]
+                    ),
+                    "plan_action_diversity_ok": (
+                        len({act for _, act in plan}) >= profile["min_distinct_actions"]
+                    ),
+                    "nonqueried_interaction_ok": (
+                        sum(1 for vid, _ in plan if vid != queried_vid) >= profile["min_nonqueried_moves"]
+                    ),
+                    "queried_interleaving_ok": (
+                        (not profile["require_queried_interleaving"])
+                        or _queried_moves_interleaved(plan, queried_vid)
+                    ),
+                    "no_action_streak_len3": not _has_action_streak(plan, streak_len=3),
+                    "no_vehicle_palindrome": not _has_vehicle_palindrome(plan),
+                    "near_true_grounded_in_visited": all(
+                        choices[L] in visited_labels
+                        for L, dty in distractor_type.items()
+                        if dty == "near_true"
+                    ),
+                    "highly_false_reachable_never_visited": all(
+                        (choices[L] in labels_for_env(env)) and (choices[L] not in visited_labels)
+                        for L, dty in distractor_type.items()
+                        if dty == "highly_false"
+                    ),
+                    # All options must be valid position labels for `env`.
                     "all_labels_in_vocabulary": all(
                         is_valid_label(choices[L], env)
-                        or choices[L] in highly_false_labels_for_env(env)
                         for L in LETTERS
                     ),
                     "five_distinct_options": len({choices[L] for L in LETTERS}) == 5,
@@ -783,9 +1784,16 @@ def generate_example(
         }
 
         # Hard quality gate (Problems 2 & 6).
-        ok, reason = validate_example(example, init_state, plan, env, queried_vid)
+        ok, reason = validate_example(
+            example,
+            init_state,
+            plan,
+            env,
+            queried_vid,
+            profile,
+        )
         if not ok:
-            # Reject and retry within the same generate_example() budget.
+            _inc(reject_stats, f"reject.validation.{reason}")
             continue
 
         return example
@@ -793,22 +1801,259 @@ def generate_example(
     return None
 
 
-# ── Main generation loop ────────────────────────────────────────────────────
+
+def _passes_soft_distribution_balance(example: dict, quality_tracker: dict) -> bool:
+    # Soft balance: don't let one correct label dominate,
+    # but don't reject so aggressively that generation stalls.
+    env_value = example["metadata"]["environment"]
+    correct_label = example["choices"][example["answer"]]
+    if env_value == Environment.MULTI_LANE.value:
+        counts: dict[str, int] = quality_tracker["multi_lane_correct_counts"]
+        if correct_label not in counts:
+            return True
+        total = sum(counts.values())
+        if total < MULTI_LANE_BALANCE_WARMUP:
+            return True
+        min_count = min(counts.values())
+        if counts[correct_label] > min_count + MULTI_LANE_CORRECT_LABEL_GAP:
+            return False
+        return True
+
+    if env_value == Environment.INTERSECTION.value:
+        counts = quality_tracker["intersection_correct_counts"]
+        if correct_label not in counts:
+            return True
+        total = sum(counts.values())
+        if total < INTERSECTION_BALANCE_WARMUP:
+            return True
+        min_count = min(counts.values())
+        if counts[correct_label] > min_count + INTERSECTION_CORRECT_LABEL_GAP:
+            return False
+    return True
+
+
+def _update_quality_tracker(example: dict, quality_tracker: dict) -> None:
+    tmpl = _plan_template_from_example(example)
+    plan_counts = quality_tracker["plan_template_counts"]
+    plan_counts[tmpl] = plan_counts.get(tmpl, 0) + 1
+
+    qshape = _queried_shape_from_example(example)
+    qshape_counts = quality_tracker["queried_shape_counts"]
+    qshape_counts[qshape] = qshape_counts.get(qshape, 0) + 1
+
+    env = example["metadata"]["environment"]
+    choices = example["choices"]
+    answer = example["answer"]
+    correct_label = choices[answer]
+
+    if env == Environment.INTERSECTION.value:
+        if correct_label in quality_tracker["intersection_correct_counts"]:
+            quality_tracker["intersection_correct_counts"][correct_label] += 1
+        qmoves = int(example["audit"]["invariants"]["queried_moved"])
+        inter_qmove_counts = quality_tracker["intersection_queried_move_counts"]
+        inter_qmove_counts[qmoves] = inter_qmove_counts.get(qmoves, 0) + 1
+        return
+
+    if env != Environment.MULTI_LANE.value:
+        return
+
+    dtypes = example["distractor_type"]
+    quality_tracker["multi_lane_correct_counts"][correct_label] += 1
+
+    hf_labels = [choices[L] for L, t in dtypes.items() if t == "highly_false"]
+    quality_tracker["multi_lane_hf_total"] += len(hf_labels)
+    for lab in hf_labels:
+        quality_tracker["multi_lane_hf_label_counts"][lab] += 1
+        if _is_shoulder_label(lab):
+            quality_tracker["multi_lane_hf_shoulder_total"] += 1
+
+    qmoves = int(example["audit"]["invariants"]["queried_moved"])
+    qmove_counts = quality_tracker["multi_lane_queried_move_counts"]
+    qmove_counts[qmoves] = qmove_counts.get(qmoves, 0) + 1
+
+
+def _assert_dataset_quality(examples: list[dict]) -> None:
+    """
+    Dataset-level checks run after generation.
+    Raises RuntimeError if any quality constraint is broken.
+    """
+    issues: list[str] = []
+
+    # Policy: intersection "inside" must never be the correct label.
+    inside_correct = 0
+    approach_opts = 0
+    for ex in examples:
+        if ex["metadata"]["environment"] != Environment.INTERSECTION.value:
+            continue
+        correct_label = ex["choices"][ex["answer"]]
+        if correct_label == "inside the intersection":
+            inside_correct += 1
+        approach_opts += sum("approach" in t for t in ex["choices"].values())
+    if inside_correct > 0:
+        issues.append(f"intersection inside-as-correct count={inside_correct} (expected 0)")
+    if approach_opts > 0:
+        issues.append(f"intersection approach options present={approach_opts} (expected 0)")
+
+    # Multi-lane shoulder HF overuse cap.
+    ml_hf_total = 0
+    ml_hf_shoulder = 0
+    for ex in examples:
+        if ex["metadata"]["environment"] != Environment.MULTI_LANE.value:
+            continue
+        for L, dty in ex["distractor_type"].items():
+            if dty != "highly_false":
+                continue
+            ml_hf_total += 1
+            if _is_shoulder_label(ex["choices"][L]):
+                ml_hf_shoulder += 1
+    if ml_hf_total > 0:
+        sh_ratio = ml_hf_shoulder / ml_hf_total
+        if sh_ratio > MULTI_LANE_HF_SHOULDER_RATIO_CAP:
+            issues.append(
+                f"multi-lane shoulder HF ratio {sh_ratio:.3f} exceeds cap "
+                f"{MULTI_LANE_HF_SHOULDER_RATIO_CAP:.3f}"
+            )
+
+    # Shape/template collapse caps.
+    queried_shape_counts: dict[tuple, int] = {}
+    plan_template_counts: dict[tuple, int] = {}
+    for ex in examples:
+        qshape = _queried_shape_from_example(ex)
+        queried_shape_counts[qshape] = queried_shape_counts.get(qshape, 0) + 1
+        pt = _plan_template_from_example(ex)
+        plan_template_counts[pt] = plan_template_counts.get(pt, 0) + 1
+
+    inter_shape_max = max(
+        (c for (env_name, _), c in queried_shape_counts.items()
+         if env_name == Environment.INTERSECTION.value),
+        default=0,
+    )
+    ml_shape_max = max(
+        (c for (env_name, _), c in queried_shape_counts.items()
+         if env_name == Environment.MULTI_LANE.value),
+        default=0,
+    )
+    if inter_shape_max > INTERSECTION_QUERIED_SHAPE_MAX_REUSE:
+        issues.append(
+            f"intersection queried-shape max reuse={inter_shape_max} "
+            f"> cap {INTERSECTION_QUERIED_SHAPE_MAX_REUSE}"
+        )
+    if ml_shape_max > MULTI_LANE_QUERIED_SHAPE_MAX_REUSE:
+        issues.append(
+            f"multi-lane queried-shape max reuse={ml_shape_max} "
+            f"> cap {MULTI_LANE_QUERIED_SHAPE_MAX_REUSE}"
+        )
+    plan_max = max(plan_template_counts.values(), default=0)
+    if plan_max > PLAN_TEMPLATE_MAX_REUSE:
+        issues.append(
+            f"plan-template max reuse={plan_max} > cap {PLAN_TEMPLATE_MAX_REUSE}"
+        )
+
+    # Difficulty should be structurally ordered, not just count-balanced.
+    by_diff: dict[str, list[dict]] = {"easy": [], "medium": [], "hard": []}
+    for ex in examples:
+        d = ex["metadata"].get("difficulty", "")
+        if d in by_diff:
+            by_diff[d].append(ex)
+    for d, arr in by_diff.items():
+        if not arr:
+            issues.append(f"difficulty {d} has zero examples")
+    if not issues:
+        mean_qmoves: dict[str, float] = {}
+        mean_nonq: dict[str, float] = {}
+        mean_actors: dict[str, float] = {}
+        for d, arr in by_diff.items():
+            qmoves_vals = []
+            nonq_vals = []
+            actors_vals = []
+            for ex in arr:
+                plan = ex["audit"]["plan"]
+                qid = ex["metadata"]["queried_vehicle"]
+                qmoves = sum(1 for vid, _ in plan if vid == qid)
+                nonq = len(plan) - qmoves
+                actors = len({vid for vid, _ in plan})
+                qmoves_vals.append(qmoves)
+                nonq_vals.append(nonq)
+                actors_vals.append(actors)
+            mean_qmoves[d] = sum(qmoves_vals) / len(qmoves_vals)
+            mean_nonq[d] = sum(nonq_vals) / len(nonq_vals)
+            mean_actors[d] = sum(actors_vals) / len(actors_vals)
+        if mean_qmoves["hard"] < mean_qmoves["easy"] + 0.15:
+            issues.append(
+                "difficulty separation too weak on queried moves: "
+                f"{mean_qmoves}"
+            )
+        if mean_nonq["hard"] < mean_nonq["easy"] + 0.15:
+            issues.append(
+                "difficulty separation too weak on non-queried moves: "
+                f"{mean_nonq}"
+            )
+        if mean_actors["hard"] < mean_actors["easy"] + 0.10:
+            issues.append(
+                "difficulty separation too weak on actor diversity: "
+                f"{mean_actors}"
+            )
+
+    # Reconstruct from serialized scenario and replay full plans.
+    replay_invalid = 0
+    replay_wrong = 0
+    replay_trace_mismatch = 0
+    for ex in examples:
+        env = Environment(ex["metadata"]["environment"])
+        vehicles: list[Vehicle] = []
+        for v in ex["scenario"]["vehicles"]:
+            inside_flag = bool(
+                v.get("inside_intersection", v.get("position") == "inside_intersection")
+            )
+            vehicles.append(
+                Vehicle(
+                    id=v["id"],
+                    position=v["position"],
+                    direction=Direction(v["direction"]),
+                    inside_intersection=inside_flag,
+                )
+            )
+        sim = ScenarioState(vehicles=vehicles, environment=env)
+        qid = ex["metadata"]["queried_vehicle"]
+        trace: dict[str, list[str]] = {v.id: [v.position] for v in sim.vehicles}
+        ok = True
+        for vid, act_name in ex["audit"]["plan"]:
+            act = Action[act_name]
+            ev = _safe_apply_action_for_env(sim, vid, act, env)
+            if not ev:
+                replay_invalid += 1
+                ok = False
+                break
+            trace[vid].append(get_required_vehicle(sim, vid).position)
+        if not ok:
+            continue
+        expected_text = ex["choices"][ex["answer"]]
+        final_label = label_of(get_required_vehicle(sim, qid).position)
+        if final_label != expected_text:
+            replay_wrong += 1
+        if trace != ex["audit"]["all_traces"]:
+            replay_trace_mismatch += 1
+    if replay_invalid or replay_wrong or replay_trace_mismatch:
+        issues.append(
+            "serialized replay mismatch: "
+            f"invalid={replay_invalid}, wrong={replay_wrong}, "
+            f"trace_mismatch={replay_trace_mismatch}"
+        )
+
+    if issues:
+        raise RuntimeError(
+            "Task1 dataset-level quality gate failed: " + " | ".join(issues)
+        )
+
+
 
 def generate_task1(n: int, output_path: str, seed: int | None = None) -> None:
-    """Generates *n* examples, writes JSONL, prints distribution stats."""
+    """Generate examples, write JSONL, and print distribution stats."""
     if seed is not None:
         random.seed(seed)
 
     if n % 5 != 0:
         raise ValueError("N must be a multiple of 5 for balanced key schedule.")
-    if n % (5 * len(TASK_ENVS)) != 0:
-        # Not strictly required, but warn the user: perfect joint balance
-        # (letter × env) needs n divisible by 10.
-        print(
-            f"NOTE: n={n} is not divisible by {5 * len(TASK_ENVS)}; joint "
-            f"letter×env balance will be approximate."
-        )
 
     # Key schedule: exactly n/5 of each letter, shuffled.
     key_schedule: list[str] = []
@@ -817,27 +2062,115 @@ def generate_task1(n: int, output_path: str, seed: int | None = None) -> None:
         key_schedule.extend([letter] * per_key)
     random.shuffle(key_schedule)
 
-    # Env schedule: stable 50/50 ratio enforced up front so we don't rely
-    # on per-example random.choice drift over 300 examples.
-    env_schedule: list[Environment] = []
-    per_env = n // len(TASK_ENVS)
-    remainder = n - per_env * len(TASK_ENVS)
-    for env in TASK_ENVS:
-        env_schedule.extend([env] * per_env)
-    env_schedule.extend([random.choice(TASK_ENVS)] * remainder)
-    random.shuffle(env_schedule)
+    # Joint schedule: balanced quotas per (difficulty, environment) cell.
+    # Keep downstream compatibility by unzipping into separate schedules.
+    joint_cells: list[tuple[str, Environment]] = [
+        (difficulty, env)
+        for difficulty in DIFFICULTIES
+        for env in TASK_ENVS
+    ]
+    joint_schedule: list[tuple[str, Environment]] = []
+    per_cell = n // len(joint_cells)
+    rem = n - per_cell * len(joint_cells)
+    for cell in joint_cells:
+        joint_schedule.extend([cell] * per_cell)
+    for i in range(rem):
+        joint_schedule.append(joint_cells[i % len(joint_cells)])
+    random.shuffle(joint_schedule)
+
+    difficulty_schedule = [difficulty for difficulty, _ in joint_schedule]
+    env_schedule = [env for _, env in joint_schedule]
+
+    quality_tracker = {
+        "intersection_correct_counts": {
+            lab: 0 for lab in INTERSECTION_CORRECT_LABELS
+        },
+        "intersection_queried_move_counts": {2: 0},
+        "multi_lane_correct_counts": {
+            lab: 0 for lab in labels_for_env(Environment.MULTI_LANE)
+        },
+        "multi_lane_hf_label_counts": {
+            lab: 0 for lab in labels_for_env(Environment.MULTI_LANE)
+        },
+        "multi_lane_hf_total": 0,
+        "multi_lane_hf_shoulder_total": 0,
+        "multi_lane_queried_move_counts": {1: 0, 2: 0, 3: 0, 4: 0},
+        "plan_template_counts": {},
+        "queried_shape_counts": {},
+    }
 
     examples: list[dict] = []
     dropped = 0
+    seen_signatures: set[tuple] = set()
+    reject_stats: dict[str, int] = {}
     for idx in range(n):
-        ex = generate_example(idx, key_schedule[idx], env_hint=env_schedule[idx])
+        ex: dict | None = None
+        for _ in range(TASK_SLOT_RETRIES):
+            candidate = generate_example(
+                idx,
+                key_schedule[idx],
+                difficulty_hint=difficulty_schedule[idx],
+                env_hint=env_schedule[idx],
+                quality_tracker=quality_tracker,
+                reject_stats=reject_stats,
+            )
+            if candidate is None:
+                _inc(reject_stats, "reject.generate_example.none")
+                continue
+            sig = _example_signature(candidate)
+            if sig in seen_signatures:
+                _inc(reject_stats, "reject.duplicate_signature")
+                continue
+            tmpl = _plan_template_from_example(candidate)
+            tmpl_count = quality_tracker["plan_template_counts"].get(tmpl, 0)
+            if tmpl_count >= PLAN_TEMPLATE_MAX_REUSE:
+                _inc(reject_stats, "reject.plan_template_cap")
+                continue
+            qshape = _queried_shape_from_example(candidate)
+            qshape_count = quality_tracker["queried_shape_counts"].get(qshape, 0)
+            env_value = candidate["metadata"]["environment"]
+            qshape_cap = (
+                INTERSECTION_QUERIED_SHAPE_MAX_REUSE
+                if env_value == Environment.INTERSECTION.value
+                else MULTI_LANE_QUERIED_SHAPE_MAX_REUSE
+            )
+            if qshape_count >= qshape_cap:
+                _inc(reject_stats, "reject.queried_shape_cap")
+                continue
+            if not _passes_soft_distribution_balance(candidate, quality_tracker):
+                _inc(reject_stats, "reject.soft_balance")
+                continue
+            seen_signatures.add(sig)
+            _update_quality_tracker(candidate, quality_tracker)
+            ex = candidate
+            break
+
         if ex is None:
             dropped += 1
-            print(f"WARNING: could not generate example {idx}, skipping.")
-            continue
+            _inc(reject_stats, "reject.slot_exhausted")
+            break
         examples.append(ex)
 
-    # ── Write output ────────────────────────────────────────────────────
+    if len(examples) != n:
+        env_counts: dict[str, int] = {}
+        for ex in examples:
+            e = ex["metadata"]["environment"]
+            env_counts[e] = env_counts.get(e, 0) + 1
+        top_reasons = sorted(
+            reject_stats.items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:12]
+        reason_summary = ", ".join(f"{k}={v}" for k, v in top_reasons) or "none"
+        raise RuntimeError(
+            "Task1 generation failed: produced "
+            f"{len(examples)}/{n} examples. "
+            f"env_counts={env_counts}. "
+            f"top_rejections=[{reason_summary}]"
+        )
+
+    _assert_dataset_quality(examples)
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         for ex in examples:
@@ -848,7 +2181,6 @@ def generate_task1(n: int, output_path: str, seed: int | None = None) -> None:
         print(f"Dropped {dropped} examples (generation failures).")
     print()
 
-    # ── Answer distribution ─────────────────────────────────────────────
     answer_counts = {letter: 0 for letter in LETTERS}
     for ex in examples:
         answer_counts[ex["answer"]] += 1
@@ -858,7 +2190,6 @@ def generate_task1(n: int, output_path: str, seed: int | None = None) -> None:
         bar = "\u2588" * answer_counts[letter]
         print(f"  {letter}: {answer_counts[letter]:3d}  {bar}")
 
-    # ── Environment distribution ────────────────────────────────────────
     env_counts: dict[str, int] = {}
     for ex in examples:
         e = ex["metadata"]["environment"]
@@ -868,7 +2199,14 @@ def generate_task1(n: int, output_path: str, seed: int | None = None) -> None:
     for e, c in sorted(env_counts.items()):
         print(f"  {e}: {c}")
 
-    # ── Distractor-type sanity check ────────────────────────────────────
+    difficulty_counts: dict[str, int] = {}
+    for ex in examples:
+        d = ex["metadata"].get("difficulty", "unknown")
+        difficulty_counts[d] = difficulty_counts.get(d, 0) + 1
+    print("\nDifficulty distribution:")
+    for d, c in sorted(difficulty_counts.items()):
+        print(f"  {d}: {c}")
+
     type_counts = {"near_true": 0, "highly_false": 0}
     for ex in examples:
         for t in ex["distractor_type"].values():
@@ -877,8 +2215,17 @@ def generate_task1(n: int, output_path: str, seed: int | None = None) -> None:
     for t, c in type_counts.items():
         print(f"  {t}: {c}")
 
+    top_reasons = sorted(
+        reject_stats.items(),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:12]
+    if top_reasons:
+        print("\nTop rejection reasons:")
+        for k, v in top_reasons:
+            print(f"  {k}: {v}")
 
-# ── Entry point ─────────────────────────────────────────────────────────────
+
 
 def _parse_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Task 1 position tracking generator")

@@ -42,26 +42,7 @@ class IntentDirection(str, Enum):
 
 
 class VehicleState(str, Enum):
-    """
-    Explicit vehicle lifecycle state. Derived deterministically from
-    (environment, position, inside_intersection) via domain.fsm.derive_state.
-
-    Intersection states
-      APPROACHING          — vehicle is on one of the arms (e.g. north_approach)
-      INSIDE_INTERSECTION  — vehicle is inside the intersection body
-      EXITED_INTERSECTION  — vehicle has reached an exit arm ({dir}_exit)
-
-    Multi-lane states
-      ON_LANE              — vehicle is on one of the three lanes
-
-    Roundabout states
-      ROUNDABOUT_APPROACHING  — vehicle is on one of the approach arms
-      IN_ROUNDABOUT           — vehicle is circulating on the ring
-      EXITED_ROUNDABOUT       — vehicle has reached an exit arm
-
-    The enum is orthogonal to the `stopped` flag: a vehicle can be stopped
-    in any state without changing state.
-    """
+    """Vehicle lifecycle state derived from position and environment."""
     APPROACHING             = "approaching"
     INSIDE_INTERSECTION     = "inside_intersection"
     EXITED_INTERSECTION     = "exited_intersection"
@@ -72,13 +53,7 @@ class VehicleState(str, Enum):
 
 
 class UnsupportedScenarioError(ValueError):
-    """
-    Raised by domain.rules dispatchers when a scenario falls outside the
-    supported input space (e.g. a roundabout right-of-way query where no
-    vehicle is inside the ring). Using a dedicated exception lets callers
-    distinguish a genuine "no conflict" answer (None) from an ill-formed
-    scenario.
-    """
+    """Scenario outside the supported rule space."""
     pass
 
 
@@ -92,9 +67,6 @@ class Vehicle:
     stopped: bool = False
 
     def describe(self) -> str:
-        # NOTE: prefer domain.render.describe_vehicle() for prompt generation —
-        # it uses POSITION_LABELS for clean human-readable labels.
-        # This method is kept only for quick debugging.
         pos_label = self.position.replace("_", " ")
         base = f"Vehicle {self.id} is in {pos_label}"
         if self.intent:

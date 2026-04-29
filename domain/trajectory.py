@@ -1,16 +1,6 @@
-"""
-Trajectory model for intersection conflict detection.
+"""Trajectory model for intersection conflict detection.
 
-Closes T2-B01 / T2-B06: right-of-way logic for intersections needs to
-distinguish between movements whose paths actually cross and movements
-that can proceed simultaneously. The previous APPROACH_PRIORITY table
-keyed on (direction_a, direction_b) alone returned None for
-opposite-direction pairs even when one vehicle was turning left across
-oncoming traffic — a real conflict the rule layer used to miss.
-
-Model
------
-The intersection body is divided into four cells arranged on a 2×2 grid:
+The intersection body is divided into four cells arranged on a 2x2 grid:
 
                   N arm
                  ┌─────┐
@@ -21,11 +11,10 @@ The intersection body is divided into four cells arranged on a 2×2 grid:
                   S arm
 
 Each (approach_direction, intent) pair maps to a frozenset of the cells
-the trajectory occupies while crossing the intersection. Two trajectories
-CONFLICT iff their cell sets intersect.
+the trajectory occupies while crossing. Two trajectories conflict when
+their cell sets intersect.
 
-Conventions (right-hand drive)
-------------------------------
+Conventions: right-hand drive.
 A vehicle approaching from N is heading south; it enters the intersection
 on the *west* half of the north arm (its right side) → entry cell = NW.
 It exits on the right side of its target arm. TURN_RIGHT hugs the entry
@@ -33,17 +22,9 @@ corner (1 cell). GO_STRAIGHT cuts across the same side (2 cells).
 TURN_LEFT sweeps through three cells to reach the diagonally opposite
 corner.
 
-Known conservative approximation
---------------------------------
 Two opposite-direction left turns (e.g. N-left and S-left) share cells in
-this model and therefore appear to conflict. In real right-hand-drive
-traffic they can often proceed simultaneously. This is an accepted
-over-approximation — it never grants priority wrongly; at worst it flags
-a conflict that resolves to "both yield" under priority-to-the-right.
-This does not affect any Task 2 scenario currently generated.
-
-This module is pure data + total functions. It raises on malformed input
-(e.g. missing intent) rather than silently returning empty sets.
+this model and therefore appear to conflict. This conservative
+approximation avoids granting priority where the model is unsure.
 """
 from __future__ import annotations
 
@@ -52,7 +33,6 @@ from typing import Optional
 from .entities import Direction, IntentDirection, Vehicle
 
 
-# ── Intersection cells ───────────────────────────────────────────────────────
 
 NE = "NE"
 NW = "NW"
@@ -62,7 +42,6 @@ SW = "SW"
 ALL_CELLS: frozenset[str] = frozenset({NE, NW, SE, SW})
 
 
-# ── Trajectory table ─────────────────────────────────────────────────────────
 
 _TRAJECTORY_CELLS: dict[tuple[Direction, IntentDirection], frozenset[str]] = {
     # From NORTH (heading south); entry = NW
@@ -87,22 +66,9 @@ _TRAJECTORY_CELLS: dict[tuple[Direction, IntentDirection], frozenset[str]] = {
 }
 
 
-# ── Public API ───────────────────────────────────────────────────────────────
 
 def trajectory_of(v: Vehicle) -> frozenset[str]:
-    """
-    Returns the set of intersection cells the vehicle occupies while
-    traversing the intersection.
-
-    Precondition: v.intent must be set. Scenarios without declared intent
-    (e.g. Task 1) cannot use the trajectory model — callers should branch
-    on intent availability and fall back to the direction-only
-    `right_of_way_intersection` in that case.
-
-    Raises:
-        ValueError: if v.intent is None or (direction, intent) is not
-        in the trajectory table (should be unreachable for valid enums).
-    """
+    """Cells occupied by the vehicle while crossing the intersection."""
     if v.intent is None:
         raise ValueError(
             f"Vehicle {v.id} has no declared intent; trajectory is undefined."
@@ -117,18 +83,12 @@ def trajectory_of(v: Vehicle) -> frozenset[str]:
 
 
 def trajectories_conflict(v1: Vehicle, v2: Vehicle) -> bool:
-    """
-    True iff the two vehicles' intersection trajectories share at least
-    one cell. Both vehicles must have declared intent.
-    """
+    """True when the two trajectories share at least one cell."""
     return bool(trajectory_of(v1) & trajectory_of(v2))
 
 
 def trajectory_cells(direction: Direction, intent: IntentDirection) -> frozenset[str]:
-    """
-    Direct lookup variant for callers that only have (direction, intent)
-    without a Vehicle instance (e.g. generator dry-runs, tests).
-    """
+    """Direct lookup for (direction, intent)."""
     key = (direction, intent)
     if key not in _TRAJECTORY_CELLS:
         raise ValueError(
@@ -138,10 +98,10 @@ def trajectory_cells(direction: Direction, intent: IntentDirection) -> frozenset
 
 
 def has_intent(v: Vehicle) -> bool:
-    """Convenience predicate: True iff the vehicle has declared intent."""
+    """True when the vehicle has declared intent."""
     return v.intent is not None
 
 
 def both_have_intent(v1: Vehicle, v2: Vehicle) -> bool:
-    """Convenience predicate for the intent-aware dispatcher path."""
+    """True when both vehicles have declared intent."""
     return v1.intent is not None and v2.intent is not None
