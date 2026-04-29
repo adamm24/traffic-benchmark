@@ -170,7 +170,7 @@ traffic-benchmark/
 │   ├── validate_task2.py
 │   ├── validate_task3.py
 │   ├── validate_task4.py
-│   └── check_task4.py
+│   └── validate_task4_distribution.py
 │
 ├── tests/
 │   └── test_domain.py
@@ -820,6 +820,8 @@ A differenza dei Task 1–3, le opzioni sono affermazioni complete (non semplici
 5. Confronto con la risposta dichiarata
 6. Contatori di qualità: prompt duplicati, leak di certezza nei near_true, contaminazione cross-environment
 
+`scripts/validate_task4_distribution.py` aggiunge controlli di distribuzione e pattern per il Task 4: bilanciamento lettere/ambienti/difficoltà, cap di riuso e riconoscimento delle famiglie di statement.
+
 ---
 
 ### 6.5 Salvaguardie Anti-Collapse
@@ -888,6 +890,7 @@ Nessuna modifica è stata apportata a `domain/`. Reviewers esterni devono essere
 python generators/task4_overlap.py --seed 42 --out dataset/core/task4_overlap.jsonl
 # Validazione indipendente:
 python scripts/validate_task4.py --input dataset/core/task4_overlap.jsonl
+python scripts/validate_task4_distribution.py --input dataset/core/task4_overlap.jsonl
 ```
 
 ---

@@ -2,7 +2,7 @@
 
 **Scope:** Core benchmark Task 4  
 **Generator:** `generators/task4_overlap.py` — version `task4_overlap_v6`  
-**Validator:** `scripts/validate_task4.py`  
+**Validators:** `scripts/validate_task4.py`, `scripts/validate_task4_distribution.py`  
 **Dataset:** `dataset/core/task4_overlap.jsonl`  
 **Last updated:** April 2026
 
@@ -126,6 +126,8 @@ Global dedup caps:
 5. comparison with declared `answer`
 6. quality counters (duplicate prompts, near-true certainty leaks, cross-env contamination)
 
+`scripts/validate_task4_distribution.py` adds Task 4 distribution and statement-pattern checks.
+
 ---
 
 ## 5. Domain Issues Found
@@ -149,6 +151,7 @@ Command:
 
 ```bash
 python scripts/validate_task4.py --input dataset/core/task4_overlap.jsonl
+python scripts/validate_task4_distribution.py --input dataset/core/task4_overlap.jsonl
 ```
 
 Result:

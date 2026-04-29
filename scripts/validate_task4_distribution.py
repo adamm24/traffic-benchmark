@@ -1,4 +1,4 @@
-"""Lightweight Task 4 distribution checker."""
+"""Task 4 distribution and statement-pattern validator."""
 
 from __future__ import annotations
 
@@ -257,7 +257,7 @@ def check_file(path: Path) -> int:
 
 
 def _parse_cli() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Task 4 v5 dataset checker")
+    parser = argparse.ArgumentParser(description="Task 4 distribution and pattern validator")
     parser.add_argument(
         "--input",
         type=str,

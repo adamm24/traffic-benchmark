@@ -30,6 +30,14 @@ Completed in this repository:
 - `tests/`: unit tests for domain behavior
 - `documentation/`: task reports and implementation notes
 
+## Scripts
+
+- `scripts/validate_task2.py`: independent Task 2 validator and shortcut audit
+- `scripts/validate_task3.py`: independent Task 3 replay validator and quality audit
+- `scripts/validate_task4.py`: independent Task 4 semantic replay validator
+- `scripts/validate_task4_distribution.py`: Task 4 distribution and statement-pattern validator
+- `scripts/build_core_simulation.py`: exports quiz-only files to `dataset/core_simulation/`
+
 ## Dataset Organization
 
 - Core benchmark data: `dataset/core/`
