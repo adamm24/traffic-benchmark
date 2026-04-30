@@ -130,18 +130,9 @@ Global dedup caps:
 
 ---
 
-## 5. Domain Issues Found
+## 5. Known Limitations
 
-One domain mismatch was found:
-- `domain.scenario` uses `left_lane/center_lane/right_lane` for `multi_lane_road`
-- `domain.vocabulary` does not expose labels for those three states
-
-Task 4 therefore uses a local read-only label workaround for multi-lane:
-- `left_lane -> the left lane`
-- `center_lane -> the center lane`
-- `right_lane -> the right lane`
-
-No modifications were made to `domain/`.
+**Vocabulary gap for multi-lane positions.** `domain/scenario.py` uses `left_lane`, `center_lane`, and `right_lane` as position keys for `multi_lane_road`, but `domain/vocabulary.py` does not provide human-readable labels for these three strings. Task 4 handles this with a local mapping inside the generator: `left_lane → the left lane`, etc. No modifications were made to `domain/`. This gap is also documented in `domain_documentation.md`.
 
 ---
 
@@ -190,8 +181,6 @@ diff /tmp/run1_task4.jsonl /tmp/run2_task4.jsonl
 
 ## 7. Summary
 
-Task 4 is complete for core generation:
-- generator + independent validator implemented
-- 100/100 examples created and validated
-- balance, overlap, uncertainty, and anti-shortcut constraints satisfied
-- deterministic and reproducible with seed
+The core dataset consists of 100 examples, all validated to zero errors by the independent validator. The generator and validator are deterministic given a fixed seed. All balance, overlap, uncertainty, and anti-shortcut constraints are satisfied.
+
+The main design challenge was constructing near-true statements that are genuinely uncertain rather than just plausible. The five epistemic statement types (spatial_present, moved_past, past_overlap, will_future, lane_order_unknown) capture distinct reasons why a statement about vehicle positions cannot be confirmed from the observable sequence alone.

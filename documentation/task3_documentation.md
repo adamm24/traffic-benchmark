@@ -42,12 +42,7 @@ The task is designed to resist two classes of shortcuts:
 
 ### 3.1 Domain layer
 
-Task 3 reuses the shared `domain/` module built for Task 1:
-
-- `entities.py` — `Vehicle`, `ScenarioState`, `Action`, `Environment`, `Direction`
-- `rules.py` — `detect_violation()` for FSM-based violations, `detect_right_of_way_violation()` for intersection priority, `is_valid_transition()` for FSM legality checks
-- `scenario.py` — `apply_action()` simulation engine, environment builders
-- `render.py` — `describe_scenario()` for natural language prompt construction
+Task 3 uses the shared `domain/` module. See `domain_documentation.md` for a full description of the state representation, traffic rules, simulation engine, and vocabulary. Task 3 relies in particular on `detect_violation()`, `detect_right_of_way_violation()`, and `is_valid_transition()` from `rules.py`.
 
 ### 3.2 Violation classes
 
@@ -183,9 +178,9 @@ The crash occurred because the `easy` tier has a structurally narrow action spac
 
 ---
 
-## 5. Known Limitations (Accepted as Policy)
+## 5. Known Limitations
 
-The following issues were analyzed and accepted as design constraints. No code changes will be made.
+The following issues were analyzed and accepted as design constraints.
 
 **`roundabout_entry_no_yield` overrepresented at ~25/80 violation records (31%).** This is a direct structural consequence of the environment design. The roundabout environment has exactly one violation class: a vehicle entering without yielding to a circulating one. There is no other illegal action possible in a roundabout under the current domain rules. Since roundabout records account for 33% of the dataset, and approximately 8 of those 33 are no-violation records, the remaining ~25 are all necessarily `roundabout_entry_no_yield`. The other environments (intersection and multi_lane_road) each support 3+ violation classes, so their violations are diluted across multiple types. Introducing artificial roundabout violation types not grounded in real traffic law would compromise domain integrity without improving benchmark quality. This is accepted as a property of the domain, analogous to `turn_right` underrepresentation in Task 2.
 
@@ -251,10 +246,8 @@ PY
 
 ## 8. Summary
 
-Task 3 reached a final quality score of **8.8/10** after three improvement passes in April 2026.
+The core engineering challenge was managing three competing pressures: correctness (every replay must confirm the ground truth), diversity (action-pattern reuse must be bounded), and feasibility (the generator must complete without exhausting the plan space in any difficulty tier). These pressures are in direct tension — tighter reuse caps improve diversity but shrink the feasible plan space, which destabilises the difficulty distribution and can crash the generator.
 
-The core engineering challenge was managing three competing pressures simultaneously: correctness (every replay must confirm the ground truth), diversity (action-pattern reuse must be bounded), and feasibility (the generator must complete without exhausting the plan space in any tier). These three pressures are in direct tension — tighter reuse caps increase diversity but shrink the feasible plan space, which destabilizes the difficulty distribution and can cause the generator to crash.
+The key structural fixes were replacing `invalid_fsm_transition` with a no-violation sentinel and adding the `ALLOWED_VIOLATION_TYPES` whitelist, introducing the dual-constraint system (`ACTION_PATTERN_REUSE_CAP` + `MAX_ACTION_PATTERN_REUSE_TOTAL`) to bound reuse without exhausting the plan space, and converting difficulty enforcement from a hard crash to a soft fallback after 180 failed slot attempts.
 
-The key structural fixes were: replacing `invalid_fsm_transition` with a no-violation sentinel and adding the `ALLOWED_VIOLATION_TYPES` whitelist, introducing the `ACTION_PATTERN_REUSE_CAP` + `MAX_ACTION_PATTERN_REUSE_TOTAL` dual-constraint system to bound reuse without exhausting the plan space, and converting difficulty enforcement from hard-crash to soft-fallback to prevent the easy-tier exhaustion crash.
-
-The two residual limitations — difficulty ±7 from target and `roundabout_entry_no_yield` at 31% of violations — are documented above and accepted as policy. The difficulty imbalance was checked across multiple strategies; the current deviation follows from the easy-tier plan space. The roundabout concentration is a domain property.
+The two residual limitations — difficulty distribution ±7 from target, and `roundabout_entry_no_yield` at 31% of violations — are documented above. The difficulty imbalance was investigated across multiple strategies; the current deviation reflects an inherent asymmetry in the easy-tier plan space. The roundabout concentration is a consequence of the domain having only one violation class for that environment.

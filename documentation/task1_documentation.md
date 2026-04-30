@@ -37,12 +37,7 @@ The task is designed to resist two classes of shortcuts:
 
 ### 3.1 Domain layer
 
-A shared `domain/` module was built as the single source of truth for all generators:
-
-- `entities.py` — defines `Vehicle`, `ScenarioState`, and enums for `Action`, `Environment`, `Direction`, `IntentDirection`
-- `rules.py` — implements traffic rules: right-of-way at intersections, roundabout priority, violation detection
-- `scenario.py` — scenario builders (`build_intersection_scenario`, `build_multi_lane_scenario`) and the simulation engine `apply_action()`
-- `vocabulary.py` — controlled vocabulary: maps internal position keys (e.g. `east_exit`) to human-readable labels (e.g. `the eastern exit`). This is the only source of allowed option strings across the entire benchmark.
+Task 1 uses the shared `domain/` module. See `domain_documentation.md` for a full description of the state representation, traffic rules, simulation engine, and vocabulary.
 
 ### 3.2 Generator design
 
@@ -183,10 +178,8 @@ PY
 
 ## 7. Summary
 
-Task 1 reached a final quality score of **9.5/10** after three improvement passes.
+All 13 invariants pass on every record, the distribution is balanced across answers, difficulties, and environments, and the retry rate is low (11%, max 2 attempts), which indicates that the constraint set is achievable without generation collapse.
 
-All 13 invariants pass on every record, the distribution is controlled across answers, difficulties and environments, and the retry rate remains low enough (11%, max 2 attempts) to show that the constraints are feasible.
+The main engineering challenge was balancing a rich invariant system — necessary to prevent shortcut exploitation — against generator efficiency. The key step was moving three invariant checks from post-hoc validation into the plan construction loop as early-pruning guards, which reduced wasted work without relaxing any correctness guarantees.
 
-The key engineering challenge was balancing the richness of the invariant system — which is necessary to prevent shortcut exploitation — against the practical efficiency of the generator. The solution was to shift invariant checks from post-hoc validation to in-loop pruning where possible, reducing wasted work without relaxing any correctness guarantees.
-
-The main residual tradeoff is that TURN_RIGHT (11%) remains slightly below TURN_LEFT (13.6%) and the lane-change actions (~22%). This asymmetry is structural: right turns have fewer valid application contexts in intersection scenarios by domain design, and is not considered a quality issue.
+The main residual imbalance is that TURN_RIGHT (11%) is slightly below TURN_LEFT (13.6%) and the lane-change actions (~22%). This asymmetry is structural: right turns have fewer valid contexts in intersection scenarios by domain design, and is not considered a quality issue.

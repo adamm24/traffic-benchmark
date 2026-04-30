@@ -146,9 +146,9 @@ Result: `intent_sensitive_priority_pair` is now True on all 100 records, 0 invar
 
 ---
 
-## 5. Known Limitations (Accepted as Policy)
+## 5. Known Limitations
 
-The following issues were analyzed and accepted as design constraints. No code changes will be made.
+The following issues were analyzed and accepted as design constraints.
 
 **"All stop / No vehicle can pass" option in only 6/100 records.** This distractor is semantically almost never valid — in a well-formed right-of-way scenario there is always a clear priority winner. Its low frequency is correct behavior, not a gap.
 
@@ -208,10 +208,8 @@ PY
 
 ## 8. Summary
 
-Task 2 reached a final quality score of **9.3/10** after two improvement passes in April 2026.
+The core engineering challenge was managing three competing constraints simultaneously: correctness (the priority vehicle must be unambiguously right under the domain rules), anti-shortcut hardness (direction-only and alphabetical heuristics must fail), and distributional balance (conflict pairs, answer letters, and environments must be uniform). Earlier versions satisfied at most two of the three at a time.
 
-The core engineering challenge was the tension between three competing constraints: correctness (the priority vehicle must be unambiguously right under the domain rules), anti-shortcut hardness (direction-only and alphabetical heuristics must fail), and distributional balance (conflict pairs, answer letters, and environments must be uniform). Earlier versions satisfied at most two of the three simultaneously.
+The main structural fixes were enforcing global dominance for priority determination, introducing a conflict-pair quota schedule to correct the B-C imbalance, fixing the `intent_sensitive_priority_pair` invariant for roundabout records, and making "Both can pass" a fixed option in every record.
 
-The main corrections were global dominance for priority determination, a conflict-pair quota schedule for the B-C imbalance, the `intent_sensitive_priority_pair` fix for roundabout records, and "Both can pass" as a fixed option. Together, these keep the invariants passing and remove the known shortcut paths.
-
-The residual limitations (B priority rare, turn right underrepresented, `inside_intersection` naming) are documented above and accepted as policy. They do not affect the correctness or the anti-shortcut properties of the dataset.
+The residual limitations (Vehicle B rarely prioritised, `turn right` underrepresented, `inside_intersection` naming) are documented above and do not affect correctness or the anti-shortcut properties of the dataset.
