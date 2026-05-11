@@ -21,11 +21,33 @@ POSITION_LABELS = {
 def _pos(position: str) -> str:
     return POSITION_LABELS.get(position, position.replace("_", " "))
 
+_POSITION_PREFIXES = (
+    "inside ",
+    "outside ",
+    "within ",
+    "near ",
+    "behind ",
+    "beside ",
+    "between ",
+    "at ",
+    "on ",
+    "under ",
+    "over ",
+    "in front of ",
+)
+
+
+def _position_clause(position_label: str) -> str:
+    label = position_label.strip()
+    lower = label.lower()
+    if any(lower.startswith(prefix) for prefix in _POSITION_PREFIXES):
+        return f"is {label}"
+    return f"is in {label}"
 
 
 def describe_vehicle(v: Vehicle) -> str:
     """Natural-language description of a vehicle's initial state."""
-    base = f"Vehicle {v.id} is in {_pos(v.position)}"
+    base = f"Vehicle {v.id} {_position_clause(_pos(v.position))}"
     if v.intent:
         base += f", intending to {v.intent.value}"
     return base + "."

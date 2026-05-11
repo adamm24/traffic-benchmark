@@ -2,6 +2,29 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+_POSITION_PREFIXES = (
+    "inside ",
+    "outside ",
+    "within ",
+    "near ",
+    "behind ",
+    "beside ",
+    "between ",
+    "at ",
+    "on ",
+    "under ",
+    "over ",
+    "in front of ",
+)
+
+
+def _position_clause(position: str) -> str:
+    label = position.replace("_", " ").strip()
+    lower = label.lower()
+    if any(lower.startswith(prefix) for prefix in _POSITION_PREFIXES):
+        return f"is {label}"
+    return f"is in {label}"
+
 
 class Direction(str, Enum):
     NORTH = "north"
@@ -67,8 +90,7 @@ class Vehicle:
     stopped: bool = False
 
     def describe(self) -> str:
-        pos_label = self.position.replace("_", " ")
-        base = f"Vehicle {self.id} is in {pos_label}"
+        base = f"Vehicle {self.id} {_position_clause(self.position)}"
         if self.intent:
             base += f", intending to {self.intent.value}"
         return base + "."

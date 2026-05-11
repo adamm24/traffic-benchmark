@@ -14,20 +14,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from domain.entities import (
-    Action, Direction, Environment, ScenarioState, Vehicle,
+    Action, Direction, Environment, Lane, ScenarioState, Vehicle,
 )
 from domain.scenario import (
     apply_action,
     build_intersection_scenario,
+    build_multi_lane_scenario,
 )
 from domain.render import render_prompt
 from domain.vocabulary import (
-    is_valid_label,
+    POSITION_LABELS,
     label_of, labels_for_env,
 )
 
 
-GENERATOR_VERSION = "task1_position.v14"   # bump when contract changes
+GENERATOR_VERSION = "task1_position.v16"   # bump when contract changes
 DEFAULT_N_EXAMPLES = 100                  # CLI --n overrides; 300 = full core
 NUM_VEHICLES = 3
 MIN_STEPS    = 3
@@ -38,10 +39,6 @@ MIN_DISTINCT_ACTORS  = 2                  # harder sequences: at least 2 vehicle
 MIN_DISTINCT_ACTIONS = 2                  # avoid monotone one-action plans
 SEQUENCE_TRIES_PER_ATTEMPT = 8            # local retries before burning outer attempt
 CHOICE_RETRIES_PER_PLAN = 6               # avoid losing attempt to one unlucky draw
-MULTI_LANE_ONE_SHOULDER_START_PROB = 0.55
-MULTI_LANE_TWO_SHOULDER_START_PROB = 0.45
-MULTI_LANE_HF_SHOULDER_WEIGHT = 0.05
-MULTI_LANE_HF_SHOULDER_RATIO_CAP = 0.38
 INTERSECTION_INSIDE_START_PROB = 0.60
 INTERSECTION_INSIDE_QUERY_BIAS = 0.45
 MULTI_LANE_BALANCE_WARMUP = 18
@@ -49,9 +46,9 @@ MULTI_LANE_CORRECT_LABEL_GAP = 6
 INTERSECTION_BALANCE_WARMUP = 18
 INTERSECTION_CORRECT_LABEL_GAP = 7
 TASK_SLOT_RETRIES = 240
-PLAN_TEMPLATE_MAX_REUSE = 8
-INTERSECTION_QUERIED_SHAPE_MAX_REUSE = 19
-MULTI_LANE_QUERIED_SHAPE_MAX_REUSE = 16
+PLAN_TEMPLATE_MAX_REUSE = 30
+INTERSECTION_QUERIED_SHAPE_MAX_REUSE = 40
+MULTI_LANE_QUERIED_SHAPE_MAX_REUSE = 40
 
 INTERSECTION_ALLOWED_CHOICE_LABELS = {
     "inside the intersection",
@@ -66,6 +63,20 @@ INTERSECTION_CORRECT_LABELS = {
     "the eastern exit",
     "the western exit",
 }
+
+MULTI_LANE_CHOICE_LABELS = [
+    label_of("left_lane"),
+    label_of("center_lane"),
+    label_of("right_lane"),
+    label_of("roundabout_lane"),
+    label_of("north_exit"),
+    label_of("south_exit"),
+    label_of("east_exit"),
+    label_of("west_exit"),
+]
+
+ALL_DOMAIN_LABELS = set(POSITION_LABELS.values())
+MULTI_LANE_ORDER = [Lane.LEFT.value, Lane.CENTER.value, Lane.RIGHT.value]
 
 TASK_ENVS = [Environment.INTERSECTION, Environment.MULTI_LANE]
 
@@ -143,11 +154,19 @@ QUESTION_HEADER_TEMPLATES = [
     "Task:",
 ]
 
+INTERSECTION_PROMPT_NOTE = (
+    'Note: In intersection scenarios, a vehicle in the "X approach" is heading '
+    'toward the X exit (its current heading is X). "moves forward" advances it '
+    "one step in that heading. If a vehicle starts inside the intersection, its "
+    "heading is stated explicitly in the scenario."
+)
+
 # Actions valid per environment (Task 1 — position only, no roundabout)
 # MOVE_FORWARD excluded from MULTI_LANE: it doesn't change lane position,
 # so it's a no-op for position tracking.
 ACTIONS_BY_ENV = {
     Environment.MULTI_LANE: [
+        Action.STOP,
         Action.CHANGE_LEFT,
         Action.CHANGE_RIGHT,
     ],
@@ -159,21 +178,6 @@ ACTIONS_BY_ENV = {
     ],
 }
 
-# 4-lane highway-like model + symmetric shoulders (reachable edge states).
-MULTI_LANE_STATE_ORDER = [
-    "left_shoulder",
-    "far_left_lane",
-    "left_center_lane",
-    "right_center_lane",
-    "far_right_lane",
-    "right_shoulder",
-]
-MULTI_LANE_DRIVING_STATES = [
-    "far_left_lane",
-    "left_center_lane",
-    "right_center_lane",
-    "far_right_lane",
-]
 MAX_QUERIED_MOVES_BY_ENV = {
     Environment.INTERSECTION: 2,
     Environment.MULTI_LANE: 4,
@@ -208,94 +212,24 @@ def safe_apply_action(
     return result if result else None
 
 
-def _apply_multi_lane_action(
-    state: ScenarioState,
-    vehicle_id: str,
-    action: Action,
-) -> str | None:
-    """Task1-local 4-lane+shoulder transition model for multi-lane prompts."""
-    v = state.get_vehicle(vehicle_id)
-    if v is None:
-        raise ValueError(f"Vehicle {vehicle_id!r} not found in scenario state.")
-    if v.position not in MULTI_LANE_STATE_ORDER:
-        return None
-    idx = MULTI_LANE_STATE_ORDER.index(v.position)
-    if action == Action.CHANGE_LEFT:
-        if idx == 0:
-            return None
-        new_pos = MULTI_LANE_STATE_ORDER[idx - 1]
-        v.position = new_pos
-        if new_pos == "left_shoulder":
-            event = f"Vehicle {v.id} moves onto the left shoulder."
-        else:
-            event = f"Vehicle {v.id} changes to the left lane."
-    elif action == Action.CHANGE_RIGHT:
-        if idx == len(MULTI_LANE_STATE_ORDER) - 1:
-            return None
-        new_pos = MULTI_LANE_STATE_ORDER[idx + 1]
-        v.position = new_pos
-        if new_pos == "right_shoulder":
-            event = f"Vehicle {v.id} moves onto the right shoulder."
-        else:
-            event = f"Vehicle {v.id} changes to the right lane."
-    else:
-        return None
-    state.event_log.append(event)
-    state.step += 1
-    return event
-
-
 def _safe_apply_action_for_env(
     state: ScenarioState,
     vehicle_id: str,
     action: Action,
     env: Environment,
 ) -> str | None:
-    if env == Environment.MULTI_LANE:
-        return _apply_multi_lane_action(state, vehicle_id, action)
     return safe_apply_action(state, vehicle_id, action)
 
 
-def _build_multi_lane_scenario(
-    num_vehicles: int = 3,
-    *,
-    compact_starts: bool = False,
-) -> ScenarioState:
-    """Task1-local multi-lane builder with controlled shoulder frequency."""
-    if compact_starts and num_vehicles >= 3:
-        # Hard-mode compact starts leave room for multi-step interaction
-        # under the strict "keep at least 2 unvisited labels" constraint.
-        lane_a = random.choice(MULTI_LANE_DRIVING_STATES)
-        lane_b = random.choice([s for s in MULTI_LANE_DRIVING_STATES if s != lane_a])
-        starts = [lane_a, lane_a, lane_b]
-        random.shuffle(starts)
-    else:
-        starts = random.sample(MULTI_LANE_DRIVING_STATES, num_vehicles)
-    # Controlled shoulder starts keep shoulder labels represented in real
-    # trajectories (not only as distractors), reducing shortcut bias.
-    if compact_starts:
-        two_shoulder_prob = MULTI_LANE_TWO_SHOULDER_START_PROB * 0.15
-        one_shoulder_prob = MULTI_LANE_ONE_SHOULDER_START_PROB * 0.35
-    else:
-        two_shoulder_prob = MULTI_LANE_TWO_SHOULDER_START_PROB
-        one_shoulder_prob = MULTI_LANE_ONE_SHOULDER_START_PROB
-    r = random.random()
-    if r < two_shoulder_prob and num_vehicles >= 2:
-        left_idx, right_idx = random.sample(range(num_vehicles), 2)
-        starts[left_idx] = "left_shoulder"
-        starts[right_idx] = "right_shoulder"
-    elif r < (two_shoulder_prob + one_shoulder_prob):
-        shoulder = random.choice(["left_shoulder", "right_shoulder"])
-        replace_idx = random.randrange(num_vehicles)
-        starts[replace_idx] = shoulder
-    vehicles: list[Vehicle] = []
-    for i, pos in enumerate(starts):
-        vehicles.append(Vehicle(
-            id=chr(65 + i),
-            position=pos,
-            direction=Direction.NORTH,
-        ))
-    return ScenarioState(vehicles=vehicles, environment=Environment.MULTI_LANE)
+def _build_multi_lane_scenario(num_vehicles: int = 3) -> ScenarioState:
+    """Task1 wrapper around the shared domain multi-lane builder."""
+    return build_multi_lane_scenario(num_vehicles)
+
+
+def _num_vehicles_for_env(env: Environment) -> int:
+    if env == Environment.MULTI_LANE:
+        return 2
+    return NUM_VEHICLES
 
 
 def _build_intersection_scenario_task1(num_vehicles: int = 3) -> ScenarioState:
@@ -439,19 +373,21 @@ def _profile_for_env(profile: dict, env: Environment, difficulty: str) -> dict:
             tuned["min_vehicles_moved"] = 2
             tuned["require_queried_interleaving"] = True
             tuned["require_other_vehicle_multi_step"] = False
+            tuned["require_near_true_from_other"] = False
             tuned["prefer_ambiguous_families"] = False
         else:  # hard
             tuned["step_min"] = 5
             tuned["step_max"] = 5
             tuned["min_queried_moves"] = 2
             tuned["max_queried_moves"] = 3
-            tuned["min_distinct_actors"] = 3
+            tuned["min_distinct_actors"] = 2
             tuned["min_distinct_actions"] = 2
             tuned["min_nonqueried_moves"] = 2
-            tuned["min_vehicles_moved"] = 3
+            tuned["min_vehicles_moved"] = 2
             tuned["require_queried_interleaving"] = True
             tuned["require_other_vehicle_multi_step"] = False
-            tuned["prefer_ambiguous_families"] = True
+            tuned["require_near_true_from_other"] = False
+            tuned["prefer_ambiguous_families"] = False
     return tuned
 
 
@@ -462,10 +398,12 @@ def _inc(counter: dict[str, int] | None, key: str) -> None:
 
 
 def _choice_labels_for_env(env: Environment) -> list[str]:
-    labels = list(labels_for_env(env))
     if env == Environment.INTERSECTION:
-        labels = [lab for lab in labels if lab in INTERSECTION_ALLOWED_CHOICE_LABELS]
-    return labels
+        labels = list(labels_for_env(env))
+        return [lab for lab in labels if lab in INTERSECTION_ALLOWED_CHOICE_LABELS]
+    if env == Environment.MULTI_LANE:
+        return list(MULTI_LANE_CHOICE_LABELS)
+    return list(labels_for_env(env))
 
 
 def _plan_template_key(plan: list[tuple[str, Action]], queried_vid: str, env: Environment) -> tuple:
@@ -510,9 +448,12 @@ def _render_prompt_with_variation(
     events: list[str],
     question: str,
     choices: dict[str, str],
+    env: Environment,
 ) -> tuple[str, str, str]:
     """Vary prompt headers without changing task semantics."""
     base = render_prompt(scenario_text, events, question, choices)
+    if env == Environment.INTERSECTION:
+        base = f"{INTERSECTION_PROMPT_NOTE}\n\n{base}"
     ev_header = random.choice(EVENT_HEADER_TEMPLATES)
     q_header = random.choice(QUESTION_HEADER_TEMPLATES)
     prompt = base.replace("Sequence of events:", ev_header, 1)
@@ -532,7 +473,11 @@ def _describe_task1_scenario(state: ScenarioState) -> str:
     }.get(state.environment, state.environment.value)
     lines = [f"{count_word} vehicles are at {env_label}."]
     for v in state.vehicles:
-        desc = f"Vehicle {v.id} is in {label_of(v.position)}"
+        label = label_of(v.position)
+        if v.position == "inside_intersection":
+            desc = f"Vehicle {v.id} is inside the intersection, heading {v.direction.value}"
+        else:
+            desc = f"Vehicle {v.id} is in {label}"
         if v.intent:
             desc += f", intending to {v.intent.value}"
         lines.append(desc + ".")
@@ -547,13 +492,9 @@ def _label_family(label: str) -> str:
         return "exit"
     if "inside the intersection" in ll:
         return "inside"
-    if "lane" in ll or "strip" in ll or "shoulder" in ll:
+    if "lane" in ll or "strip" in ll:
         return "lane_like"
     return "other"
-
-
-def _is_shoulder_label(label: str) -> bool:
-    return "shoulder" in label.lower()
 
 
 def _weighted_label_pick(labels: list[str], weights: list[float]) -> str:
@@ -575,11 +516,9 @@ def _hf_weight(
     env: Environment,
     hf_label_usage: dict[str, int] | None,
 ) -> float:
+    _ = env
     usage = 0 if hf_label_usage is None else hf_label_usage.get(label, 0)
-    w = 1.0 / (1.0 + usage)
-    if env == Environment.MULTI_LANE and _is_shoulder_label(label):
-        w *= MULTI_LANE_HF_SHOULDER_WEIGHT
-    return w
+    return 1.0 / (1.0 + usage)
 
 
 def _example_signature(example: dict) -> tuple:
@@ -592,6 +531,56 @@ def _example_signature(example: dict) -> tuple:
     queried = example["metadata"]["queried_vehicle"]
     env = example["metadata"]["environment"]
     return (env, vehicles, queried, plan)
+
+
+def _has_position_overlap(state: ScenarioState) -> bool:
+    positions = [v.position for v in state.vehicles]
+    return len(set(positions)) != len(positions)
+
+
+def _would_overlap_on_action(
+    state: ScenarioState,
+    vehicle_id: str,
+    action: Action,
+    env: Environment,
+) -> bool:
+    vehicle = state.get_vehicle(vehicle_id)
+    if vehicle is None:
+        return False
+    occupied = {
+        v.position
+        for v in state.vehicles
+        if v.id != vehicle_id
+    }
+
+    if env == Environment.INTERSECTION:
+        if action == Action.MOVE_FORWARD:
+            return "inside_intersection" in occupied
+        if action in (Action.TURN_LEFT, Action.TURN_RIGHT) and vehicle.position == "inside_intersection":
+            order = [Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST]
+            idx = order.index(vehicle.direction)
+            if action == Action.TURN_RIGHT:
+                new_dir = order[(idx + 1) % 4]
+            else:
+                new_dir = order[(idx - 1) % 4]
+            return f"{new_dir.value}_exit" in occupied
+        return False
+
+    if env == Environment.MULTI_LANE and action in (Action.CHANGE_LEFT, Action.CHANGE_RIGHT):
+        if vehicle.position not in MULTI_LANE_ORDER:
+            return False
+        idx = MULTI_LANE_ORDER.index(vehicle.position)
+        if action == Action.CHANGE_LEFT:
+            if idx == 0:
+                return False
+            target = MULTI_LANE_ORDER[idx - 1]
+        else:
+            if idx == len(MULTI_LANE_ORDER) - 1:
+                return False
+            target = MULTI_LANE_ORDER[idx + 1]
+        return target in occupied
+
+    return False
 
 
 
@@ -641,6 +630,8 @@ def generate_sequence(
     min_nonqueried_moves = max(0, min_nonqueried_moves)
     min_vehicles_moved = max(1, min_vehicles_moved)
     if min_queried_moves > n_steps:
+        return None
+    if _has_position_overlap(state):
         return None
 
     for _ in range(MAX_RETRIES):
@@ -801,10 +792,14 @@ def generate_sequence(
                     # 1c. No monotone action streaks.
                     if len(plan) >= 2 and plan[-1][1] == act and plan[-2][1] == act:
                         continue
+                    if _would_overlap_on_action(trial_state, try_vid, act, env):
+                        continue
 
                     snapshot = copy.deepcopy(trial_state)
                     result = _safe_apply_action_for_env(snapshot, try_vid, act, env)
                     if result is None:
+                        continue
+                    if _has_position_overlap(snapshot):
                         continue
 
                     # 2. Anti-zigzag per vehicle.
@@ -1032,7 +1027,6 @@ def build_choices(
     require_near_true_from_other: bool = False,
     prefer_ambiguous_families: bool = False,
     hf_label_usage: dict[str, int] | None = None,
-    hf_balance: dict[str, int] | None = None,
 ) -> dict[str, dict] | None:
     """
     Build 5-way MCQ with closed state-space logic:
@@ -1124,15 +1118,21 @@ def build_choices(
         other_pool = [c for c in nt_pool if str(c["source"]).startswith("other_")]
         if not other_pool:
             return None
-        # replace second slot to force cross-vehicle tracking ambiguity
+        # Prefer a label-different replacement; if not available, switch
+        # provenance to an other-vehicle candidate with the same label.
         replacement_pool = [
             c for c in other_pool
             if c["label"] != selected_nt[0]["label"]
         ]
-        if not replacement_pool:
-            return None
-        repl = random.choice(replacement_pool)
-        selected_nt[1] = repl
+        if replacement_pool:
+            repl = random.choice(replacement_pool)
+            selected_nt[1] = repl
+        else:
+            label_to_replace = selected_nt[0]["label"]
+            same_label_other = [c for c in other_pool if c["label"] == label_to_replace]
+            if not same_label_other:
+                return None
+            selected_nt[0] = random.choice(same_label_other)
 
     nt1_label = str(selected_nt[0]["label"])
     nt1_rationale = str(selected_nt[0]["rationale"])
@@ -1163,27 +1163,6 @@ def build_choices(
         return _weighted_pick_two_distinct(hf_pool, hf_weights)
 
     hf1_label, hf2_label = _pick_hf_pair()
-    # Soft shoulder cap: resample HF pair instead of rejecting whole example.
-    if env == Environment.MULTI_LANE and hf_balance is not None:
-        shoulder_hf_now = int(hf_balance.get("multi_lane_hf_shoulder_total", 0))
-        hf_total_now = int(hf_balance.get("multi_lane_hf_total", 0))
-        non_shoulder_pool = [lab for lab in hf_pool if not _is_shoulder_label(lab)]
-        for _ in range(12):
-            shoulder_in_pair = int(_is_shoulder_label(hf1_label)) + int(_is_shoulder_label(hf2_label))
-            next_ratio = (shoulder_hf_now + shoulder_in_pair) / max(1, hf_total_now + 2)
-            if next_ratio <= MULTI_LANE_HF_SHOULDER_RATIO_CAP:
-                break
-            if len(non_shoulder_pool) >= 2:
-                hf_weights = [_hf_weight(lab, env, hf_label_usage) for lab in non_shoulder_pool]
-                hf1_label, hf2_label = _weighted_pick_two_distinct(non_shoulder_pool, hf_weights)
-                continue
-            if len(non_shoulder_pool) == 1:
-                hf1_label = non_shoulder_pool[0]
-                rem = [lab for lab in hf_pool if lab != hf1_label]
-                rem_weights = [_hf_weight(lab, env, hf_label_usage) for lab in rem]
-                hf2_label = _weighted_label_pick(rem, rem_weights)
-                continue
-            hf1_label, hf2_label = _pick_hf_pair()
 
     hf1_rationale = "reachable same-environment state never visited by any vehicle"
     hf2_rationale = "reachable same-environment state never visited by any vehicle"
@@ -1306,10 +1285,14 @@ def validate_example(
     answer_letter = example["answer"]
     correct_text = choices[answer_letter]
 
-    # V1 — environment consistency
+    # V1 — task-level choice-space consistency
+    allowed_choice_labels = set(_choice_labels_for_env(env))
     for letter, text in choices.items():
-        if not is_valid_label(text, env):
-            return False, f"choice {letter} {text!r} not env-consistent for {env.value}"
+        if text not in allowed_choice_labels:
+            return False, f"choice {letter} {text!r} not in allowed choice-space for {env.value}"
+
+    if _has_position_overlap(init_state):
+        return False, "overlap detected in initial state"
 
     # V2 — pairwise distinct
     if len({text for text in choices.values()}) != 5:
@@ -1320,10 +1303,14 @@ def validate_example(
     replay_trace: dict[str, list[str]] = {
         v.id: [v.position] for v in replay.vehicles
     }
+    if _has_position_overlap(replay):
+        return False, "overlap detected at replay step 0"
     for vid, act in plan:
         ev = _safe_apply_action_for_env(replay, vid, act, env)
         if not ev:
             return False, f"invalid planned transition during replay: ({vid}, {act})"
+        if _has_position_overlap(replay):
+            return False, f"overlap detected during replay after ({vid}, {act.name})"
         replay_trace[vid].append(get_required_vehicle(replay, vid).position)
     final_pos = get_required_vehicle(replay, queried_vid).position
     if label_of(final_pos) != correct_text:
@@ -1456,12 +1443,12 @@ def validate_example(
         return False, "audit rationale_by_letter does not cover A..E"
 
     # V13 — anti-shortcut option checks
-    real_env_count = sum(1 for text in choices.values() if is_valid_label(text, env))
-    if real_env_count != 5:
+    real_choice_space_count = sum(1 for text in choices.values() if text in allowed_choice_labels)
+    if real_choice_space_count != 5:
         return False, "non-closed-set label detected in choices"
     correct_family = _label_family(correct_text)
     family_domain_count = sum(
-        1 for label in labels_for_env(env)
+        1 for label in _choice_labels_for_env(env)
         if _label_family(label) == correct_family
     )
     family_distractors = sum(
@@ -1515,13 +1502,14 @@ def generate_example(
             continue
         n_steps = random.randint(step_low, step_high)
 
+        num_vehicles = _num_vehicles_for_env(env)
         if env == Environment.MULTI_LANE:
-            state = _build_multi_lane_scenario(
-                NUM_VEHICLES,
-                compact_starts=(difficulty == "hard"),
-            )
+            state = _build_multi_lane_scenario(num_vehicles)
         else:
-            state = _build_intersection_scenario_task1(NUM_VEHICLES)
+            state = _build_intersection_scenario_task1(num_vehicles)
+        if _has_position_overlap(state):
+            _inc(reject_stats, f"reject.initial_overlap.{env.value}")
+            continue
 
         max_env_qmoves = MAX_QUERIED_MOVES_BY_ENV.get(env, n_steps)
         interleave_cap = (
@@ -1608,7 +1596,7 @@ def generate_example(
                 min_vehicles_moved=seq_min_vehicles_moved,
                 require_queried_interleaving=profile["require_queried_interleaving"],
                 require_other_vehicle_multi_step=seq_require_other_vehicle_multi_step,
-                max_unique_positions=(4 if env == Environment.MULTI_LANE else None),
+                max_unique_positions=None,
                 choice_label_cap=(3 if env == Environment.INTERSECTION else None),
                 choice_label_vocab=(
                     set(INTERSECTION_ALLOWED_CHOICE_LABELS)
@@ -1664,9 +1652,6 @@ def generate_example(
                     if (quality_tracker is not None and env == Environment.MULTI_LANE)
                     else None
                 ),
-                hf_balance=(
-                    quality_tracker if (quality_tracker is not None and env == Environment.MULTI_LANE) else None
-                ),
             )
             if raw_choices is not None:
                 break
@@ -1687,7 +1672,7 @@ def generate_example(
         scenario_text = _describe_task1_scenario(init_state)
         question = _pick_question(queried_vid)
         prompt, event_header_used, question_header_used = _render_prompt_with_variation(
-            scenario_text, events, question, choices
+            scenario_text, events, question, choices, env
         )
 
         example = {
@@ -1712,7 +1697,7 @@ def generate_example(
             "answer": answer,
             "distractor_type": distractor_type,
             "metadata": {
-                "num_vehicles": NUM_VEHICLES,
+                "num_vehicles": len(init_state.vehicles),
                 "num_events": len(events),
                 "queried_vehicle": queried_vid,
                 "environment": env.value,
@@ -1769,13 +1754,13 @@ def generate_example(
                         if dty == "near_true"
                     ),
                     "highly_false_reachable_never_visited": all(
-                        (choices[L] in labels_for_env(env)) and (choices[L] not in visited_labels)
+                        (choices[L] in _choice_labels_for_env(env)) and (choices[L] not in visited_labels)
                         for L, dty in distractor_type.items()
                         if dty == "highly_false"
                     ),
-                    # All options must be valid position labels for `env`.
+                    # All options must be valid domain labels.
                     "all_labels_in_vocabulary": all(
-                        is_valid_label(choices[L], env)
+                        choices[L] in ALL_DOMAIN_LABELS
                         for L in LETTERS
                     ),
                     "five_distinct_options": len({choices[L] for L in LETTERS}) == 5,
@@ -1863,9 +1848,9 @@ def _update_quality_tracker(example: dict, quality_tracker: dict) -> None:
     hf_labels = [choices[L] for L, t in dtypes.items() if t == "highly_false"]
     quality_tracker["multi_lane_hf_total"] += len(hf_labels)
     for lab in hf_labels:
-        quality_tracker["multi_lane_hf_label_counts"][lab] += 1
-        if _is_shoulder_label(lab):
-            quality_tracker["multi_lane_hf_shoulder_total"] += 1
+        quality_tracker["multi_lane_hf_label_counts"][lab] = (
+            quality_tracker["multi_lane_hf_label_counts"].get(lab, 0) + 1
+        )
 
     qmoves = int(example["audit"]["invariants"]["queried_moved"])
     qmove_counts = quality_tracker["multi_lane_queried_move_counts"]
@@ -1893,26 +1878,6 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
         issues.append(f"intersection inside-as-correct count={inside_correct} (expected 0)")
     if approach_opts > 0:
         issues.append(f"intersection approach options present={approach_opts} (expected 0)")
-
-    # Multi-lane shoulder HF overuse cap.
-    ml_hf_total = 0
-    ml_hf_shoulder = 0
-    for ex in examples:
-        if ex["metadata"]["environment"] != Environment.MULTI_LANE.value:
-            continue
-        for L, dty in ex["distractor_type"].items():
-            if dty != "highly_false":
-                continue
-            ml_hf_total += 1
-            if _is_shoulder_label(ex["choices"][L]):
-                ml_hf_shoulder += 1
-    if ml_hf_total > 0:
-        sh_ratio = ml_hf_shoulder / ml_hf_total
-        if sh_ratio > MULTI_LANE_HF_SHOULDER_RATIO_CAP:
-            issues.append(
-                f"multi-lane shoulder HF ratio {sh_ratio:.3f} exceeds cap "
-                f"{MULTI_LANE_HF_SHOULDER_RATIO_CAP:.3f}"
-            )
 
     # Shape/template collapse caps.
     queried_shape_counts: dict[tuple, int] = {}
@@ -1998,6 +1963,8 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
     replay_invalid = 0
     replay_wrong = 0
     replay_trace_mismatch = 0
+    replay_overlap_init = 0
+    replay_overlap_during = 0
     for ex in examples:
         env = Environment(ex["metadata"]["environment"])
         vehicles: list[Vehicle] = []
@@ -2016,12 +1983,19 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
         sim = ScenarioState(vehicles=vehicles, environment=env)
         qid = ex["metadata"]["queried_vehicle"]
         trace: dict[str, list[str]] = {v.id: [v.position] for v in sim.vehicles}
+        if _has_position_overlap(sim):
+            replay_overlap_init += 1
+            continue
         ok = True
         for vid, act_name in ex["audit"]["plan"]:
             act = Action[act_name]
             ev = _safe_apply_action_for_env(sim, vid, act, env)
             if not ev:
                 replay_invalid += 1
+                ok = False
+                break
+            if _has_position_overlap(sim):
+                replay_overlap_during += 1
                 ok = False
                 break
             trace[vid].append(get_required_vehicle(sim, vid).position)
@@ -2033,11 +2007,19 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
             replay_wrong += 1
         if trace != ex["audit"]["all_traces"]:
             replay_trace_mismatch += 1
-    if replay_invalid or replay_wrong or replay_trace_mismatch:
+    if (
+        replay_invalid
+        or replay_wrong
+        or replay_trace_mismatch
+        or replay_overlap_init
+        or replay_overlap_during
+    ):
         issues.append(
             "serialized replay mismatch: "
             f"invalid={replay_invalid}, wrong={replay_wrong}, "
-            f"trace_mismatch={replay_trace_mismatch}"
+            f"trace_mismatch={replay_trace_mismatch}, "
+            f"overlap_init={replay_overlap_init}, "
+            f"overlap_during={replay_overlap_during}"
         )
 
     if issues:
@@ -2090,10 +2072,9 @@ def generate_task1(n: int, output_path: str, seed: int | None = None) -> None:
             lab: 0 for lab in labels_for_env(Environment.MULTI_LANE)
         },
         "multi_lane_hf_label_counts": {
-            lab: 0 for lab in labels_for_env(Environment.MULTI_LANE)
+            lab: 0 for lab in _choice_labels_for_env(Environment.MULTI_LANE)
         },
         "multi_lane_hf_total": 0,
-        "multi_lane_hf_shoulder_total": 0,
         "multi_lane_queried_move_counts": {1: 0, 2: 0, 3: 0, 4: 0},
         "plan_template_counts": {},
         "queried_shape_counts": {},

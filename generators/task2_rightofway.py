@@ -36,22 +36,31 @@ from domain.trajectory import trajectories_conflict
 
 
 
-GENERATOR_VERSION = "task2_rightofway_v3"
+GENERATOR_VERSION = "task2_rightofway_v4_1"
 DEFAULT_N_EXAMPLES = 100
 DEFAULT_SEED: int | None = None
 
 NUM_VEHICLES = 3
 MAX_RETRIES = 200
 
-# Keep enough intersections for intent-sensitive reasoning while avoiding a
-# correct-vehicle shortcut: strict intersection cases mostly force Vehicle C.
-INTERSECTION_TARGET_SHARE = 0.34
+# Keep intersections dominant: this task should mostly test intent-sensitive
+# right-of-way reasoning, with a smaller roundabout slice.
+INTERSECTION_TARGET_SHARE = 0.60
+# Sub-slice of all examples dedicated to 4-way cyclic/no-clear intersection.
+INTERSECTION_NO_CLEAR_SHARE = 0.08
+# Additional no-clear intersection slice with explicit right-vs-left conflicts.
+INTERSECTION_NO_CLEAR_TURNMIX_SHARE = 0.08
+# Additional no-clear 3-vehicle straight slice to avoid correlating
+# "No unambiguous right of way" only with 4-vehicle scenarios.
+INTERSECTION_NO_CLEAR_3WAY_SHARE = 0.06
 
 LETTERS = ["A", "B", "C", "D", "E"]
 PRIORITY_LABELS = ["A", "B", "C"]
 ROUNDABOUT_PRIORITY_LABEL = "A"
 PAIR_KEYS = ["A-B", "A-C", "B-C"]
 BOTH_OPTION_TEXT = "Both can pass at the same time"
+NO_CLEAR_OPTION_TEXT = "No vehicle has an unambiguous right of way"
+NO_CLEAR_EXTRA_HF_TEXT = "One vehicle always has absolute priority regardless of intent"
 
 INTERSECTION_QUESTIONS = [
     "Which vehicle has the right of way before the others?",
@@ -59,6 +68,12 @@ INTERSECTION_QUESTIONS = [
     "According to traffic rules, which vehicle has priority now?",
     "Which vehicle has priority in this situation?",
     "Which vehicle should proceed first under right-of-way rules?",
+]
+
+INTERSECTION_NO_CLEAR_QUESTIONS = [
+    "Which option best describes right of way in this intersection?",
+    "Is there one vehicle with clear right of way before the others?",
+    "Which statement about priority is correct in this situation?",
 ]
 
 ROUNDABOUT_QUESTIONS = [
@@ -83,6 +98,23 @@ ROUNDABOUT_CONTEXTS = [
     "This roundabout follows standard right-of-way rules.",
     "No temporary traffic control is active at the roundabout.",
     "Use standard roundabout yielding rules.",
+]
+
+INTERSECTION_NO_CLEAR_STRAIGHT_CONTEXTS = [
+    "All four approaches are active and no signal controls are present.",
+    "All vehicles are proceeding straight through the unsignalized intersection.",
+]
+
+INTERSECTION_NO_CLEAR_TURNMIX_CONTEXTS = [
+    "All four approaches are active and no signal controls are present.",
+    "No temporary traffic control or police direction is present.",
+    "Rule note: when trajectories conflict, left turns yield to oncoming straight/right traffic; otherwise priority-to-the-right applies.",
+]
+
+INTERSECTION_NO_CLEAR_3WAY_CONTEXTS = [
+    "Three approaches are active and no signal controls are present.",
+    "All vehicles are proceeding straight through the unsignalized intersection.",
+    "No temporary traffic control or police direction is present.",
 ]
 
 # Fallback highly-false statements for rare blocked distractor pools.
@@ -357,7 +389,7 @@ def _relabel_intersection_for_anti_shortcut(
     Finds an ID relabeling (A/B/C permutation) that:
       1) keeps the scenario valid under strict derive logic
       2) enforces the requested priority label
-      3) rejects alphabetical-non-left shortcut wins
+      3) prefers (but does not force) alphabetical-non-left shortcut failure
       4) balances residual usage inside the allowed label bucket
     """
     original_ids = [v.id for v in state.vehicles]
@@ -376,10 +408,10 @@ def _relabel_intersection_for_anti_shortcut(
         priority_vid = derived[0]
         if priority_vid != desired_priority_label:
             continue
-        if _alphabetical_non_left_heuristic(trial) == priority_vid:
-            continue
+        alpha_hit = int(_alphabetical_non_left_heuristic(trial) == priority_vid)
 
         score = (
+            alpha_hit,
             priority_label_usage[priority_vid],
             priority_vid,
         )
@@ -437,124 +469,72 @@ def _build_env_schedule(n: int) -> list[Environment]:
     return schedule
 
 
-def _build_pair_schedule(env_schedule: list[Environment]) -> list[str]:
-    """Build the target conflict-pair schedule."""
-    n = len(env_schedule)
+def _build_mode_schedule(n: int, env_schedule: list[Environment]) -> list[str]:
+    """
+    Build per-example mode schedule:
+      - intersection_priority: unique global winner exists
+      - intersection_no_clear_straight: 4-way straight cyclic case (no unique winner)
+      - intersection_no_clear_turnmix: 4-way mixed-intent no-clear case
+      - intersection_no_clear_threeway: 3-way straight no-clear case
+      - roundabout_priority: standard inside-priority roundabout
+    """
+    if n != len(env_schedule):
+        raise ValueError("env_schedule length mismatch")
     if n == 0:
         return []
 
     intersection_indices = [
         i for i, env in enumerate(env_schedule) if env == Environment.INTERSECTION
     ]
-    roundabout_indices = [
-        i for i, env in enumerate(env_schedule) if env == Environment.ROUNDABOUT
-    ]
-    n_int = len(intersection_indices)
-    n_rnd = len(roundabout_indices)
+    n_intersection = len(intersection_indices)
+    if n_intersection == 0:
+        return ["roundabout_priority"] * n
 
-    # Balanced global thirds, with deterministic remainder assignment.
-    targets = {
-        "A-B": n // 3,
-        "A-C": n // 3,
-        "B-C": n // 3,
-    }
-    remainder = n - 3 * (n // 3)
-    for key in ("B-C", "A-B", "A-C")[:remainder]:
-        targets[key] += 1
+    target_no_clear_straight = int(round(n * INTERSECTION_NO_CLEAR_SHARE))
+    target_no_clear_turnmix = int(round(n * INTERSECTION_NO_CLEAR_TURNMIX_SHARE))
+    target_no_clear_3way = int(round(n * INTERSECTION_NO_CLEAR_3WAY_SHARE))
 
-    # Roundabout slots always materialize as A-B in this strict generator.
-    if targets["A-B"] < n_rnd:
-        deficit = n_rnd - targets["A-B"]
-        targets["A-B"] += deficit
-        # Pull quota from A-C first, then B-C while keeping a safety floor.
-        min_bc_goal = 15 if n >= 45 and n_int >= 15 else 0
-        take_ac = min(deficit, targets["A-C"])
-        targets["A-C"] -= take_ac
-        deficit -= take_ac
-        if deficit > 0:
-            take_bc = max(0, targets["B-C"] - min_bc_goal)
-            take_bc = min(deficit, take_bc)
-            targets["B-C"] -= take_bc
-            deficit -= take_bc
-        if deficit > 0:
-            raise RuntimeError(
-                "pair schedule infeasible after enforcing roundabout A-B floor"
-            )
+    n_no_clear_straight = max(1, min(n_intersection - 3, target_no_clear_straight))
+    remaining_after_straight = max(2, n_intersection - n_no_clear_straight - 1)
+    n_no_clear_turnmix = max(1, min(remaining_after_straight - 1, target_no_clear_turnmix))
+    remaining_after_turnmix = max(1, n_intersection - n_no_clear_straight - n_no_clear_turnmix - 1)
+    n_no_clear_3way = max(1, min(remaining_after_turnmix, target_no_clear_3way))
 
-    # Enforce B-C feasibility and floor for larger datasets.
-    if targets["B-C"] > n_int:
-        overflow = targets["B-C"] - n_int
-        targets["B-C"] = n_int
-        targets["A-C"] += overflow
-    if n >= 45 and n_int >= 15 and targets["B-C"] < 15:
-        deficit = 15 - targets["B-C"]
-        if targets["A-C"] < deficit:
-            raise RuntimeError(
-                "cannot enforce minimum B-C quota without violating constraints"
-            )
-        targets["A-C"] -= deficit
-        targets["B-C"] += deficit
+    selected_straight = set(random.sample(intersection_indices, n_no_clear_straight))
+    remaining_pool = [i for i in intersection_indices if i not in selected_straight]
+    selected_turnmix = set(random.sample(remaining_pool, n_no_clear_turnmix))
+    remaining_pool = [i for i in remaining_pool if i not in selected_turnmix]
+    selected_3way = set(random.sample(remaining_pool, n_no_clear_3way))
 
-    rnd_ab = n_rnd
-    rnd_ac = 0
-
-    int_ab = targets["A-B"] - rnd_ab
-    int_ac = targets["A-C"] - rnd_ac
-    int_bc = targets["B-C"]
-
-    if min(int_ab, int_ac, int_bc) < 0:
-        raise RuntimeError("negative pair quota generated")
-    if int_ab + int_ac + int_bc != n_int:
-        raise RuntimeError("intersection pair quota does not match intersection slots")
-
-    pair_schedule = [""] * n
-
-    int_pairs = ["A-B"] * int_ab + ["A-C"] * int_ac + ["B-C"] * int_bc
-    rnd_pairs = ["A-B"] * rnd_ab + ["A-C"] * rnd_ac
-    random.shuffle(int_pairs)
-    random.shuffle(rnd_pairs)
-
-    for idx, pair in zip(intersection_indices, int_pairs):
-        pair_schedule[idx] = pair
-    for idx, pair in zip(roundabout_indices, rnd_pairs):
-        pair_schedule[idx] = pair
-
-    if any(pair not in PAIR_KEYS for pair in pair_schedule):
-        raise RuntimeError("pair schedule contains invalid entries")
-    return pair_schedule
+    modes: list[str] = []
+    for i, env in enumerate(env_schedule):
+        if env == Environment.ROUNDABOUT:
+            modes.append("roundabout_priority")
+        elif i in selected_straight:
+            modes.append("intersection_no_clear_straight")
+        elif i in selected_turnmix:
+            modes.append("intersection_no_clear_turnmix")
+        elif i in selected_3way:
+            modes.append("intersection_no_clear_threeway")
+        else:
+            modes.append("intersection_priority")
+    return modes
 
 
-def _build_priority_schedule(
-    env_schedule: list[Environment],
-    pair_schedule: list[str],
-) -> list[str]:
+def _build_priority_schedule(mode_schedule: list[str]) -> list[str]:
     """
-    Build desired priority labels compatible with (env, expected pair).
-
-    The priority label must be one of the two labels in the scheduled conflict
-    pair. Pick the least-used compatible label per slot so the final correct
-    vehicle text is not dominated by one vehicle.
+    Build desired priority labels for priority-bearing modes.
+    Empty string means "not applicable" (intersection_no_clear mode).
     """
-    if len(env_schedule) != len(pair_schedule):
-        raise ValueError("env_schedule and pair_schedule length mismatch")
-
-    labels = [""] * len(env_schedule)
+    labels = [""] * len(mode_schedule)
     usage: Counter[str] = Counter()
-
-    for i, (env, pair) in enumerate(zip(env_schedule, pair_schedule)):
-        if pair not in PAIR_KEYS:
-            raise RuntimeError(f"invalid pair key at {i}: {pair!r}")
-        if env == Environment.ROUNDABOUT and pair != "A-B":
-            raise RuntimeError(
-                f"roundabout slot {i} has unsupported pair {pair!r}"
-            )
-        possible = pair.split("-")
-        label = min(possible, key=lambda candidate: (usage[candidate], candidate))
+    for i, mode in enumerate(mode_schedule):
+        if mode.startswith("intersection_no_clear"):
+            continue
+        # Rebalance globally across A/B/C to avoid literal-answer dominance.
+        label = min(PRIORITY_LABELS, key=lambda candidate: (usage[candidate], candidate))
         labels[i] = label
         usage[label] += 1
-
-    if any(label not in PRIORITY_LABELS for label in labels):
-        raise RuntimeError("priority schedule contains invalid entries")
     return labels
 
 
@@ -813,17 +793,179 @@ def _build_roundabout_priority_scenario() -> tuple[
     return None
 
 
+def _has_right_turn_vs_left_turn_conflict(
+    state: ScenarioState,
+    pair_assessments: list[PairAssessment],
+) -> bool:
+    """True when at least one conflicting pair is right-turn vs left-turn."""
+    by_id = {v.id: v for v in state.vehicles}
+    for p in pair_assessments:
+        if not p.conflict:
+            continue
+        i1 = by_id[p.v1].intent
+        i2 = by_id[p.v2].intent
+        if {i1, i2} == {IntentDirection.TURN_LEFT, IntentDirection.TURN_RIGHT}:
+            return True
+    return False
+
+
+def _has_opposite_straight_pair(state: ScenarioState) -> bool:
+    by_dir: dict[Direction, Vehicle] = {v.direction: v for v in state.vehicles}
+    for v in state.vehicles:
+        if v.intent != IntentDirection.GO_STRAIGHT:
+            continue
+        opp_dir = Direction(_OPPOSITE_DIR[v.direction.value])
+        ov = by_dir.get(opp_dir)
+        if ov is None:
+            continue
+        if ov.intent == IntentDirection.GO_STRAIGHT:
+            return True
+    return False
+
+
+def _derive_no_clear_structure(
+    state: ScenarioState,
+    require_all_straight: bool = False,
+    require_right_left_conflict: bool = False,
+    forbid_opposite_straight_pair: bool = False,
+) -> tuple[list[PairAssessment], dict[str, set[str]], dict[str, set[str]]] | None:
+    """
+    Validate and derive the 4-way cyclic intersection structure where no unique
+    global priority exists.
+    """
+    if state.environment != Environment.INTERSECTION:
+        return None
+    if len(state.vehicles) not in (3, 4):
+        return None
+
+    # Fixed no-clear scaffold: all sampled approaches are distinct.
+    dirs = {v.direction for v in state.vehicles}
+    if len(dirs) != len(state.vehicles):
+        return None
+    if require_all_straight and any(v.intent != IntentDirection.GO_STRAIGHT for v in state.vehicles):
+        return None
+
+    vids = [v.id for v in state.vehicles]
+    wins: dict[str, set[str]] = {vid: set() for vid in vids}
+    conflicts: dict[str, set[str]] = {vid: set() for vid in vids}
+    pair_assessments: list[PairAssessment] = []
+
+    for i in range(len(state.vehicles)):
+        for j in range(i + 1, len(state.vehicles)):
+            p = _pair_assessment(state.vehicles[i], state.vehicles[j], state.environment)
+            if p is None:
+                return None
+            pair_assessments.append(p)
+            if not p.conflict or p.winner is None:
+                continue
+            a, b = p.v1, p.v2
+            conflicts[a].add(b)
+            conflicts[b].add(a)
+            loser = b if p.winner == a else a
+            wins[p.winner].add(loser)
+
+    dominant = [
+        vid for vid in vids
+        if conflicts[vid] and wins[vid] == conflicts[vid] and len(conflicts[vid]) == len(vids) - 1
+    ]
+    if dominant:
+        return None
+
+    if require_all_straight:
+        # In the 4-way straight cyclic case every vehicle should conflict with
+        # two adjacent vehicles, creating no global dominant winner.
+        if len(state.vehicles) == 4 and any(len(conflicts[vid]) != 2 for vid in vids):
+            return None
+    if require_right_left_conflict and not _has_right_turn_vs_left_turn_conflict(
+        state, pair_assessments
+    ):
+        return None
+    if forbid_opposite_straight_pair and _has_opposite_straight_pair(state):
+        return None
+
+    return pair_assessments, wins, conflicts
+
+
+def _build_intersection_no_clear_scenario() -> tuple[
+    ScenarioState,
+    list[PairAssessment],
+    dict[str, set[str]],
+    dict[str, set[str]],
+] | None:
+    return _build_intersection_no_clear_scenario_for_subtype("straight")
+
+
+def _build_intersection_no_clear_scenario_for_subtype(
+    subtype: str,
+) -> tuple[
+    ScenarioState,
+    list[PairAssessment],
+    dict[str, set[str]],
+    dict[str, set[str]],
+] | None:
+    for _ in range(MAX_RETRIES):
+        if subtype == "threeway":
+            state = build_intersection_scenario(3, with_intent=True)
+        else:
+            state = build_intersection_scenario(4, with_intent=True)
+
+        if subtype in {"straight", "threeway"}:
+            for v in state.vehicles:
+                v.intent = IntentDirection.GO_STRAIGHT
+
+        # Shuffle label-role mapping to avoid fixed id->direction shortcuts.
+        labels = ["A", "B", "C", "D"] if len(state.vehicles) == 4 else ["A", "B", "C"]
+        random.shuffle(labels)
+        old_to_new = {v.id: labels[i] for i, v in enumerate(state.vehicles)}
+        for v in state.vehicles:
+            v.id = old_to_new[v.id]
+
+        if subtype == "straight":
+            derived = _derive_no_clear_structure(
+                state,
+                require_all_straight=True,
+                require_right_left_conflict=False,
+            )
+        elif subtype == "turnmix":
+            derived = _derive_no_clear_structure(
+                state,
+                require_all_straight=False,
+                require_right_left_conflict=True,
+                forbid_opposite_straight_pair=True,
+            )
+        elif subtype == "threeway":
+            derived = _derive_no_clear_structure(
+                state,
+                require_all_straight=True,
+                require_right_left_conflict=False,
+            )
+        else:
+            return None
+        if derived is None:
+            continue
+        return state, *derived
+    return None
+
+
 def _enhance_scenario_text(
     base_text: str,
     env: Environment,
     context_usage: Counter[str],
+    mode: str | None = None,
     commit: bool = True,
 ) -> tuple[str, str]:
-    pool = (
-        INTERSECTION_CONTEXTS
-        if env == Environment.INTERSECTION
-        else ROUNDABOUT_CONTEXTS
-    )
+    if mode == "intersection_no_clear_straight":
+        pool = INTERSECTION_NO_CLEAR_STRAIGHT_CONTEXTS
+    elif mode == "intersection_no_clear_turnmix":
+        pool = INTERSECTION_NO_CLEAR_TURNMIX_CONTEXTS
+    elif mode == "intersection_no_clear_threeway":
+        pool = INTERSECTION_NO_CLEAR_3WAY_CONTEXTS
+    else:
+        pool = (
+            INTERSECTION_CONTEXTS
+            if env == Environment.INTERSECTION
+            else ROUNDABOUT_CONTEXTS
+        )
     context = _pick_least_used(pool, context_usage, commit=commit)
     return base_text + "\n" + context, context
 
@@ -835,21 +977,43 @@ def build_choices(
     third_vid: str,
     env: Environment,
     hf_usage: Counter[str],
+    mode: str = "priority",
     commit: bool = True,
     state: ScenarioState | None = None,
     pair_assessments: list[PairAssessment] | None = None,
 ) -> dict[str, dict[str, str]]:
     """
-    Returns exactly 5 typed options: 1 correct + 2 near_true + 2 highly_false.
+    Returns exactly 5 typed options.
 
-    Always includes "Both can pass at the same time":
-      - near_true when exactly one active conflict pair exists
-      - highly_false otherwise
+    Mode "priority":
+      - 1 correct vehicle + 2 near_true + 2 highly_false
+      - always includes "Both can pass at the same time" (typed by conflict count)
 
-    When *state* and *pair_assessments* are provided, the two highly_false
-    policy distractors are built from actual scenario directions/intents
-    rather than falling back to generic pool statements.
+    Mode "intersection_no_clear":
+      - correct = NO_CLEAR_OPTION_TEXT
+      - all four vehicle labels are distractors
     """
+    if mode.startswith("intersection_no_clear"):
+        if state is None or len(state.vehicles) not in (3, 4):
+            raise ValueError("intersection_no_clear mode requires a 3- or 4-vehicle state")
+        vids = sorted(v.id for v in state.vehicles)
+        random.shuffle(vids)
+        if len(vids) == 4:
+            return {
+                "correct": {"text": NO_CLEAR_OPTION_TEXT, "type": "correct"},
+                "near_true_1": {"text": f"Vehicle {vids[0]}", "type": "near_true"},
+                "near_true_2": {"text": f"Vehicle {vids[1]}", "type": "near_true"},
+                "highly_false_1": {"text": f"Vehicle {vids[2]}", "type": "highly_false"},
+                "highly_false_2": {"text": f"Vehicle {vids[3]}", "type": "highly_false"},
+            }
+        return {
+            "correct": {"text": NO_CLEAR_OPTION_TEXT, "type": "correct"},
+            "near_true_1": {"text": f"Vehicle {vids[0]}", "type": "near_true"},
+            "near_true_2": {"text": f"Vehicle {vids[1]}", "type": "near_true"},
+            "highly_false_1": {"text": f"Vehicle {vids[2]}", "type": "highly_false"},
+            "highly_false_2": {"text": NO_CLEAR_EXTRA_HF_TEXT, "type": "highly_false"},
+        }
+
     scenario_hf_pool: list[str] = []
     active_conflicts = (
         sum(1 for p in pair_assessments if p.conflict)
@@ -952,12 +1116,11 @@ def validate_example_contract(example: dict) -> tuple[bool, str]:
     answer = example["answer"]
     answer_text = choices[answer]
     dtypes = example["distractor_type"]
+    resolution = example.get("metadata", {}).get("resolution", "unique_priority")
 
     # V1: 5 unique options
     if len(set(choices.values())) != 5:
         return False, "duplicate choice texts"
-    if sum(1 for t in choices.values() if t == BOTH_OPTION_TEXT) != 1:
-        return False, "missing fixed 'Both can pass at the same time' option"
 
     # V2: distractor type balance
     nt = sum(1 for t in dtypes.values() if t == "near_true")
@@ -971,8 +1134,46 @@ def validate_example_contract(example: dict) -> tuple[bool, str]:
         if sum(1 for t in choices.values() if t == f"Vehicle {vid}") != 1:
             return False, f"vehicle option count invalid for Vehicle {vid}"
 
-    # V4: independent recomputation from scenario JSON
     state = _reconstruct_state(example["scenario"])
+    metadata = example.get("metadata", {})
+    if resolution == "intersection_no_clear":
+        if example["scenario"]["environment"] != Environment.INTERSECTION.value:
+            return False, "no-clear examples must be intersections"
+        if answer_text != NO_CLEAR_OPTION_TEXT:
+            return False, "no-clear answer text mismatch"
+        if sum(1 for t in choices.values() if t == NO_CLEAR_OPTION_TEXT) != 1:
+            return False, "no-clear answer option missing"
+        if sum(1 for t in choices.values() if t == BOTH_OPTION_TEXT) > 0:
+            return False, "'Both can pass' must not appear in no-clear examples"
+        subtype = metadata.get("no_clear_subtype")
+        if subtype not in {"straight", "turnmix", "threeway"}:
+            return False, "invalid no-clear subtype"
+        no_clear = _derive_no_clear_structure(
+            state,
+            require_all_straight=(subtype == "straight"),
+            require_right_left_conflict=(subtype == "turnmix"),
+            forbid_opposite_straight_pair=(subtype == "turnmix"),
+        )
+        if no_clear is None:
+            return False, "scenario is not a valid no-clear case"
+        pair_assessments, _, _ = no_clear
+        conflict_count = sum(1 for p in pair_assessments if p.conflict)
+        min_conflicts = 2 if subtype == "threeway" else 4
+        if conflict_count < min_conflicts:
+            return False, "no-clear case has too few conflicts"
+        if metadata.get("priority_vehicle") is not None:
+            return False, "no-clear metadata.priority_vehicle must be null"
+        if metadata.get("yielding_vehicle") is not None:
+            return False, "no-clear metadata.yielding_vehicle must be null"
+        if metadata.get("conflict_pair", []):
+            return False, "no-clear metadata.conflict_pair must be empty"
+        return True, "ok"
+
+    # Unique-priority mode
+    if sum(1 for t in choices.values() if t == BOTH_OPTION_TEXT) != 1:
+        return False, "missing fixed 'Both can pass at the same time' option"
+
+    # V4: independent recomputation from scenario JSON
     derived = _derive_priority_structure(state)
     if derived is None:
         return False, "scenario has no unique global priority vehicle"
@@ -993,7 +1194,6 @@ def validate_example_contract(example: dict) -> tuple[bool, str]:
             f"priority Vehicle {priority_vid}"
         )
 
-    metadata = example.get("metadata", {})
     if metadata.get("priority_vehicle") != priority_vid:
         return False, "metadata.priority_vehicle mismatch"
     if metadata.get("yielding_vehicle") != yielding_vid:
@@ -1016,8 +1216,6 @@ def validate_example_contract(example: dict) -> tuple[bool, str]:
             return False, "priority vehicle has no intent-sensitive pair"
         if direction_only_priority == priority_vid:
             return False, "direction-only heuristic still recovers priority"
-        if _alphabetical_non_left_heuristic(state) == priority_vid:
-            return False, "alphabetical non-left heuristic still recovers priority"
 
     return True, "ok"
 
@@ -1027,7 +1225,7 @@ def generate_example(
     example_id: int,
     correct_key: str,
     seed: int | None,
-    env_hint: Environment,
+    mode: str,
     desired_priority_label: str,
     question_usage: Counter[str],
     context_usage: Counter[str],
@@ -1035,39 +1233,56 @@ def generate_example(
     priority_label_usage: Counter[str],
 ) -> dict | None:
     for attempt in range(MAX_RETRIES):
-        env = env_hint
-
-        if env == Environment.INTERSECTION:
+        no_clear_subtype: str | None = None
+        if mode in {
+            "intersection_no_clear_straight",
+            "intersection_no_clear_turnmix",
+            "intersection_no_clear_threeway",
+        }:
+            env = Environment.INTERSECTION
+            if mode == "intersection_no_clear_straight":
+                subtype = "straight"
+            elif mode == "intersection_no_clear_turnmix":
+                subtype = "turnmix"
+            else:
+                subtype = "threeway"
+            no_clear_subtype = subtype
+            result_no_clear = _build_intersection_no_clear_scenario_for_subtype(subtype)
+            question = _pick_least_used(
+                INTERSECTION_NO_CLEAR_QUESTIONS,
+                question_usage,
+                commit=False,
+            )
+            if result_no_clear is None:
+                continue
+            state, pair_assessments, wins, conflicts = result_no_clear
+            priority_vid = ""
+            yielding_vid = ""
+            third_vid = ""
+            intent_sensitive_with_priority = True
+            direction_only_priority = None
+            resolution = "intersection_no_clear"
+        elif mode == "intersection_priority":
+            env = Environment.INTERSECTION
             result = _build_intersection_priority_scenario()
             question = _pick_least_used(
                 INTERSECTION_QUESTIONS,
                 question_usage,
                 commit=False,
             )
-        else:
-            result = _build_roundabout_priority_scenario()
-            question = _pick_least_used(
-                ROUNDABOUT_QUESTIONS,
-                question_usage,
-                commit=False,
-            )
-
-        if result is None:
-            continue
-
-        (
-            state,
-            priority_vid,
-            yielding_vid,
-            third_vid,
-            pair_assessments,
-            wins,
-            conflicts,
-            intent_sensitive_with_priority,
-            direction_only_priority,
-        ) = result
-
-        if env == Environment.INTERSECTION:
+            if result is None:
+                continue
+            (
+                state,
+                priority_vid,
+                yielding_vid,
+                third_vid,
+                pair_assessments,
+                wins,
+                conflicts,
+                intent_sensitive_with_priority,
+                direction_only_priority,
+            ) = result
             relabeled = _relabel_intersection_for_anti_shortcut(
                 state,
                 priority_label_usage,
@@ -1086,7 +1301,28 @@ def generate_example(
                 intent_sensitive_with_priority,
                 direction_only_priority,
             ) = relabeled_derived
-        else:
+            resolution = "unique_priority"
+        elif mode == "roundabout_priority":
+            env = Environment.ROUNDABOUT
+            result = _build_roundabout_priority_scenario()
+            question = _pick_least_used(
+                ROUNDABOUT_QUESTIONS,
+                question_usage,
+                commit=False,
+            )
+            if result is None:
+                continue
+            (
+                state,
+                priority_vid,
+                yielding_vid,
+                third_vid,
+                pair_assessments,
+                wins,
+                conflicts,
+                intent_sensitive_with_priority,
+                direction_only_priority,
+            ) = result
             state = _relabel_roundabout_for_priority_balance(
                 state,
                 desired_priority_label=desired_priority_label,
@@ -1104,11 +1340,15 @@ def generate_example(
                 intent_sensitive_with_priority,
                 direction_only_priority,
             ) = relabeled_derived
+            resolution = "unique_priority"
+        else:
+            raise RuntimeError(f"unknown generation mode: {mode!r}")
 
         scenario_text, context_line = _enhance_scenario_text(
             describe_scenario(state),
             env,
             context_usage,
+            mode=mode,
             commit=False,
         )
         raw_choices = build_choices(
@@ -1117,6 +1357,7 @@ def generate_example(
             third_vid,
             env,
             hf_usage,
+            mode=mode,
             commit=False,
             state=state,
             pair_assessments=pair_assessments,
@@ -1162,16 +1403,23 @@ def generate_example(
             "answer": answer,
             "distractor_type": distractor_type,
             "metadata": {
-                "num_vehicles": NUM_VEHICLES,
+                "num_vehicles": len(state.vehicles),
                 "environment": env.value,
-                "priority_vehicle": priority_vid,
-                "yielding_vehicle": yielding_vid,
-                "third_vehicle": third_vid,
-                "conflict_pair": sorted([priority_vid, yielding_vid]),
+                "priority_vehicle": priority_vid if resolution == "unique_priority" else None,
+                "yielding_vehicle": yielding_vid if resolution == "unique_priority" else None,
+                "third_vehicle": third_vid if resolution == "unique_priority" else None,
+                "conflict_pair": (
+                    sorted([priority_vid, yielding_vid])
+                    if resolution == "unique_priority"
+                    else []
+                ),
                 "pair_conflict_count": conflict_count,
                 "intent_sensitive_priority_pair": intent_sensitive_with_priority,
                 "direction_only_priority": direction_only_priority,
-                "difficulty": "strict",
+                "difficulty": "strict" if resolution == "unique_priority" else "cyclic_no_clear",
+                "resolution": resolution,
+                "mode": mode,
+                "no_clear_subtype": no_clear_subtype,
             },
             "audit": {
                 "generator_version": GENERATOR_VERSION,
@@ -1186,19 +1434,30 @@ def generate_example(
                 "invariants": {
                     "five_distinct_options": len({choices[l] for l in LETTERS}) == 5,
                     "priority_conflicts_with_all_others": (
-                        len(conflicts[priority_vid]) == NUM_VEHICLES - 1
+                        resolution != "unique_priority"
+                        or len(conflicts[priority_vid]) == len(state.vehicles) - 1
                     ),
-                    "pair_conflict_count_at_least_2": conflict_count >= 2,
+                    "pair_conflict_count_at_least_2": (
+                        conflict_count >= (4 if resolution == "intersection_no_clear" else 2)
+                    ),
                     "intent_sensitive_priority_pair": intent_sensitive_with_priority,
                     "direction_only_does_not_match_priority": (
-                        direction_only_priority != priority_vid
+                        resolution != "unique_priority"
+                        or direction_only_priority != priority_vid
                     ),
                     "answer_text_matches_priority": (
                         choices[answer] == f"Vehicle {priority_vid}"
+                        if resolution == "unique_priority"
+                        else choices[answer] == NO_CLEAR_OPTION_TEXT
                     ),
-                    "alphabetical_non_left_heuristic_fails": (
-                        env != Environment.INTERSECTION
-                        or _alphabetical_non_left_heuristic(state) != priority_vid
+                    "no_clear_is_ambiguous": (
+                        resolution != "intersection_no_clear"
+                        or _derive_no_clear_structure(
+                            state,
+                            require_all_straight=(no_clear_subtype == "straight"),
+                            require_right_left_conflict=(no_clear_subtype == "turnmix"),
+                            forbid_opposite_straight_pair=(no_clear_subtype == "turnmix"),
+                        ) is not None
                     ),
                 },
                 "context_line": context_line,
@@ -1214,7 +1473,8 @@ def generate_example(
         context_usage[context_line] += 1
         hf_usage[raw_choices["highly_false_1"]["text"]] += 1
         hf_usage[raw_choices["highly_false_2"]["text"]] += 1
-        priority_label_usage[priority_vid] += 1
+        if resolution == "unique_priority":
+            priority_label_usage[priority_vid] += 1
 
         return example
 
@@ -1236,8 +1496,8 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
     random.shuffle(key_schedule)
 
     env_schedule = _build_env_schedule(n)
-    pair_schedule = _build_pair_schedule(env_schedule)
-    priority_schedule = _build_priority_schedule(env_schedule, pair_schedule)
+    mode_schedule = _build_mode_schedule(n, env_schedule)
+    priority_schedule = _build_priority_schedule(mode_schedule)
     question_usage: Counter[str] = Counter()
     context_usage: Counter[str] = Counter()
     hf_usage: Counter[str] = Counter()
@@ -1246,26 +1506,25 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
     examples: list[dict] = []
     seen_prompts: set[str] = set()
     for idx in range(n):
-        env_hint = env_schedule[idx]
-        expected_pair = pair_schedule[idx]
+        mode = mode_schedule[idx]
         desired_priority_label = priority_schedule[idx]
-        if desired_priority_label not in PRIORITY_LABELS:
+        if not mode.startswith("intersection_no_clear") and desired_priority_label not in PRIORITY_LABELS:
             raise RuntimeError(
                 f"invalid desired priority label at idx={idx}: {desired_priority_label!r}"
             )
         ex = None
         priority_candidates = [desired_priority_label]
-        for alt in expected_pair.split("-"):
-            if alt != desired_priority_label:
-                priority_candidates.append(alt)
-
+        if not mode.startswith("intersection_no_clear"):
+            for alt in PRIORITY_LABELS:
+                if alt not in priority_candidates:
+                    priority_candidates.append(alt)
         for _ in range(MAX_RETRIES):
             for wanted_priority in priority_candidates:
                 candidate = generate_example(
                     idx,
                     key_schedule[idx],
                     seed,
-                    env_hint,
+                    mode,
                     wanted_priority,
                     question_usage,
                     context_usage,
@@ -1273,12 +1532,6 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                     priority_label_usage,
                 )
                 if candidate is None:
-                    continue
-                cand_pair = candidate["metadata"].get("conflict_pair")
-                if not isinstance(cand_pair, list) or len(cand_pair) != 2:
-                    continue
-                candidate_pair = "-".join(sorted(cand_pair))
-                if candidate_pair != expected_pair:
                     continue
                 if candidate["prompt"] in seen_prompts:
                     continue
@@ -1290,8 +1543,8 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
         if ex is None:
             raise RuntimeError(
                 f"could not generate strict Task 2 example {idx} "
-                f"(env={env_hint.value}, pair={expected_pair}, "
-                f"priority={desired_priority_label}) after {MAX_RETRIES} retries"
+                f"(mode={mode}, priority={desired_priority_label}) "
+                f"after {MAX_RETRIES} retries"
             )
         examples.append(ex)
 
@@ -1345,7 +1598,9 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
 
     pv_counts: dict[str, int] = {}
     for ex in examples:
-        pv = ex["metadata"]["priority_vehicle"]
+        pv = ex["metadata"].get("priority_vehicle")
+        if pv is None:
+            continue
         pv_counts[pv] = pv_counts.get(pv, 0) + 1
     print("\nPriority vehicle distribution:")
     for vid, c in sorted(pv_counts.items()):
@@ -1359,6 +1614,14 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
     for c, n_examples in sorted(conflict_counts.items()):
         print(f"  {c}: {n_examples}")
 
+    mode_counts: dict[str, int] = {}
+    for ex in examples:
+        mode = ex.get("metadata", {}).get("mode", "<missing-mode>")
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+    print("\nMode distribution:")
+    for mode, c in sorted(mode_counts.items()):
+        print(f"  {mode}: {c}")
+
     pair_counts: dict[str, int] = {}
     for ex in examples:
         pair_list = ex["metadata"].get("conflict_pair", [])
@@ -1368,6 +1631,14 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
     print("\nConflict-pair distribution:")
     for pair in PAIR_KEYS:
         print(f"  {pair}: {pair_counts.get(pair, 0)}")
+
+    correct_text_counts: dict[str, int] = {}
+    for ex in examples:
+        t = ex["choices"][ex["answer"]]
+        correct_text_counts[t] = correct_text_counts.get(t, 0) + 1
+    top_text = max(correct_text_counts.values()) if correct_text_counts else 0
+    if top_text > int(0.55 * n):
+        raise RuntimeError("overuse of one literal correct answer detected")
 
 
 def _parse_cli() -> argparse.Namespace:

@@ -60,7 +60,7 @@ SLOT_EARLY_FALLBACK_ATTEMPTS = 180
 HIGH_ATTEMPT_SLOT_THRESHOLD = 200
 
 LETTERS = ["A", "B", "C", "D", "E"]
-QUESTION = "Which vehicle performed an illegal action?"
+QUESTION = "Which vehicle performs the first illegal action?"
 
 SEMANTIC_VEHICLE_A = "vehicle_a"
 SEMANTIC_VEHICLE_B = "vehicle_b"
@@ -72,7 +72,7 @@ SEMANTIC_CHOICES = {
     SEMANTIC_VEHICLE_A: "Vehicle A",
     SEMANTIC_VEHICLE_B: "Vehicle B",
     SEMANTIC_VEHICLE_C: "Vehicle C",
-    SEMANTIC_UNDETERMINED: "No vehicle can be determined",
+    SEMANTIC_UNDETERMINED: "No vehicle performed an illegal action",
     SEMANTIC_FIFTH_DISTRACTOR: "Another vehicle (not A, B, or C)",
 }
 
@@ -1715,7 +1715,7 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
     )
     if undetermined_correct != no_violation_count:
         raise RuntimeError(
-            "No vehicle can be determined must be correct exactly in no_violation examples"
+            "No vehicle performed an illegal action must be correct exactly in no_violation examples"
         )
 
     violating_examples = [

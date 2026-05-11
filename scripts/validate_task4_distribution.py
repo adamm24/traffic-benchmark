@@ -122,6 +122,11 @@ def check_file(path: Path) -> int:
             choices = ex.get("choices", {})
             distractor_type = ex.get("distractor_type", {})
 
+            if ex.get("task") != validator.TASK_NAME:
+                issues.append(
+                    f"line {line_no} {ex.get('id', '?')}: task label mismatch: {ex.get('task')!r}"
+                )
+
             if answer in LETTERS:
                 answer_counts[answer] += 1
                 if answer in choices:

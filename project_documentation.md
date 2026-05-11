@@ -771,7 +771,7 @@ python generators/task3_violation.py --n 100 --seed 42 --out dataset/core/task3_
 
 ---
 
-## 6. Task 4 — Overlap Reasoning
+## 6. Task 4 — Certainty Under Spatial Ambiguity
 
 ### 6.1 Descrizione
 
@@ -919,7 +919,7 @@ I modelli da valutare sono organizzati in **6 gruppi basati su ipotesi** — ogn
 | T1 Position Tracking | Baseline | Confronto | Confronto | Soffitto | Confronto | Principale |
 | T2 Right-of-Way | Baseline | Confronto | Confronto | Soffitto | Rule retrieval | Principale |
 | T3 Violation Detection | Stress test | Confronto | Confronto | Soffitto | Confronto | Principale |
-| T4 Overlap Reasoning | Stress test | Confronto | Confronto | Soffitto | Confronto | Focus primario |
+| T4 Certainty Under Spatial Ambiguity | Stress test | Confronto | Confronto | Soffitto | Confronto | Focus primario |
 
 ---
 

@@ -1,4 +1,4 @@
-"""Task 4 overlap-reasoning generator."""
+"""Task 4 certainty-under-spatial-ambiguity generator."""
 
 from __future__ import annotations
 
@@ -28,11 +28,12 @@ from domain.vocabulary import label_of, labels_for_env, positions_for_env
 
 
 N_EXAMPLES = 100
-GENERATOR_VERSION = "task4_overlap_v6"
+GENERATOR_VERSION = "task4_certainty_ambiguity_v1"
 MAX_RETRIES = 150
 NUM_VEHICLES = 3
 LETTERS = ["A", "B", "C", "D", "E"]
 QUESTION = "Which of the following statements is certainly true at the end of the sequence?"
+TASK_NAME = "certainty_under_spatial_ambiguity"
 STATEMENT_SIGNATURE_REUSE_CAP = 6
 EVENT_SIG_CAP = 20
 CORRECT_TEXT_CAP = 20
@@ -92,8 +93,8 @@ RE_WILL_EXIT_BEFORE_ENTER_ROUND = re.compile(
 RE_WILL_ENTER_BEFORE_EXIT_ROUND = re.compile(
     r"^Vehicle ([ABC]) will enter the roundabout before Vehicle ([ABC]) exits\.$"
 )
-# Past-overlap uncertainty patterns: past state inside the intersection/roundabout is
-# unknowable from the final state → always "uncertain".
+# Past-overlap uncertainty patterns are uncertain only if the referenced pair
+# actually overlapped during replay.
 RE_WAS_AHEAD_INTER = re.compile(
     r"^Vehicle ([ABC]) was ahead of Vehicle ([ABC]) inside the intersection\.$"
 )
@@ -1401,7 +1402,7 @@ def _validate_invariants(
         "five_distinct_statements": inv4,
         "no_cross_env_positions": inv5,
         "replay_matches_audit_final_state": inv6,
-        "overlap_condition_met": inv7,
+        "spatial_ambiguity_condition_met": inv7,
         "at_least_two_vehicles_act": inv8,
         "no_action_streak_len3": inv9,
         "no_abab_pattern": inv10,
@@ -1486,7 +1487,7 @@ def generate_example(
         assert isinstance(overlap_pair, list)
         example = {
             "id": f"task4_{example_id:04d}",
-            "task": "overlap_reasoning",
+            "task": TASK_NAME,
             "prompt": prompt,
             "scenario": _serialize_state(init_state),
             "events": events,
@@ -1679,7 +1680,9 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
                     )
 
         if (not overlap_any) and (ex["metadata"]["certainly_true_category"] not in {"containment_non_entry", "lane_position"}):
-            issues.append(f"{ex['id']}: missing overlap despite non-entry exception not active")
+            issues.append(
+                f"{ex['id']}: spatial ambiguity condition not met for this category"
+            )
 
         plan = ex.get("audit", {}).get("plan", [])
         actor_ids = [step[0] for step in plan if isinstance(step, list) and len(step) == 2]
@@ -1879,7 +1882,7 @@ def generate_task4(n: int, output_path: str, seed: int | None = None) -> None:
 
 
 def _parse_cli() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Task 4 overlap reasoning generator")
+    p = argparse.ArgumentParser(description="Task 4 certainty-under-spatial-ambiguity generator")
     p.add_argument("--n", type=int, default=N_EXAMPLES, help=f"Number of examples (default: {N_EXAMPLES})")
     p.add_argument("--seed", type=int, default=None, help="Random seed (omit for a fresh dataset each run)")
     p.add_argument(

@@ -22,6 +22,7 @@ from domain.vocabulary import label_of, labels_for_env, positions_for_env
 
 
 LETTERS = ("A", "B", "C", "D", "E")
+TASK_NAME = "certainty_under_spatial_ambiguity"
 EVENT_SIG_CAP = 20
 CORRECT_TEXT_CAP = 20
 MULTI_LANE_POSITIONS_TASK4 = ("left_lane", "center_lane", "right_lane")
@@ -526,6 +527,9 @@ def replay_example(ex: dict) -> ReplayResult:
 
 def validate_example(ex: dict) -> tuple[bool, bool, str]:
     # (ok, invalid, reason)
+    if ex.get("task") != TASK_NAME:
+        return False, True, f"task label must be {TASK_NAME!r}"
+
     choices = ex.get("choices", {})
     answer = ex.get("answer")
     dtypes = ex.get("distractor_type", {})
@@ -583,7 +587,7 @@ def validate_example(ex: dict) -> tuple[bool, bool, str]:
 
     cat = ex.get("metadata", {}).get("certainly_true_category")
     if (not replay.overlap_detected) and (cat not in {"containment_non_entry", "lane_position"}):
-        return False, False, "overlap condition not met"
+        return False, False, "spatial ambiguity condition not met"
 
     return True, False, "ok"
 
@@ -701,7 +705,7 @@ def validate_file(path: Path) -> int:
 
 
 def _parse_cli() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Independent validator for Task 4 overlap reasoning")
+    p = argparse.ArgumentParser(description="Independent validator for Task 4 certainty under spatial ambiguity")
     p.add_argument(
         "--input",
         type=str,

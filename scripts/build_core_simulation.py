@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build quiz-only files under dataset/core_simulation."""
+"""Build quiz-only files under dataset/core_simulation and final variants."""
 from __future__ import annotations
 
 import argparse
@@ -15,13 +15,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from domain.vocabulary import label_of
-from scripts.validate_task2 import recompute_priority
+from scripts.validate_task2 import NO_CLEAR_OPTION_TEXT, recompute_priority
 from scripts.validate_task3 import validate_example as validate_task3_example
 from scripts.validate_task4 import validate_example as validate_task4_example
 
 
 LETTERS = ("A", "B", "C", "D", "E")
 ALLOWED_CLEAN_KEYS = {"id", "task", "prompt", "choices", "answer"}
+ALLOWED_NO_ANSWER_KEYS = ALLOWED_CLEAN_KEYS - {"answer"}
 FORBIDDEN_PATTERNS = (
     "near_true",
     "highly_false",
@@ -120,6 +121,21 @@ def clean_example(ex: dict) -> dict:
     }
 
 
+def remove_answer(ex: dict) -> dict:
+    if "answer" not in ex:
+        raise ValidationError(f"{ex.get('id', '?')}: answer missing before no-answer export")
+    return {key: value for key, value in ex.items() if key != "answer"}
+
+
+def final_paths(out_dir: Path, file_name: str) -> tuple[Path, Path]:
+    stem = Path(file_name).stem
+    final_dir = out_dir / "final"
+    return (
+        final_dir / f"{stem}_with_answers.jsonl",
+        final_dir / f"{stem}_no_answers.jsonl",
+    )
+
+
 def check_choices_answer(ex: dict, *, where: str) -> None:
     choices = ex.get("choices")
     answer = ex.get("answer")
@@ -159,13 +175,18 @@ def validate_source_task2(rows: list[dict]) -> None:
         where = ex.get("id", "?")
         check_choices_answer(ex, where=where)
         check_no_false_invariants(ex, where=where)
-        priority = recompute_priority(ex["scenario"]).priority
-        if priority is None:
-            raise ValidationError(f"{where}: priority recompute failed")
-        expected = f"Vehicle {priority}"
-        if ex["choices"][ex["answer"]] != expected:
+        recomputed = recompute_priority(ex["scenario"])
+        answer_text = ex["choices"][ex["answer"]]
+        if recomputed.priority is None:
+            if answer_text != NO_CLEAR_OPTION_TEXT:
+                raise ValidationError(
+                    f"{where}: expected no-clear answer {NO_CLEAR_OPTION_TEXT!r}, got {answer_text!r}"
+                )
+            continue
+        expected = f"Vehicle {recomputed.priority}"
+        if answer_text != expected:
             raise ValidationError(
-                f"{where}: wrong answer, expected {expected!r}, got {ex['choices'][ex['answer']]!r}"
+                f"{where}: wrong answer, expected {expected!r}, got {answer_text!r}"
             )
 
 
@@ -274,6 +295,26 @@ def validate_clean(rows: list[dict], *, task_name: str, expected_n: int) -> dict
     }
 
 
+def validate_no_answer(
+    with_answer_rows: list[dict],
+    no_answer_rows: list[dict],
+    *,
+    task_name: str,
+) -> None:
+    if len(with_answer_rows) != len(no_answer_rows):
+        raise ValidationError(
+            f"{task_name}: no-answer row count mismatch "
+            f"{len(no_answer_rows)} vs {len(with_answer_rows)}"
+        )
+    for idx, (with_answer, no_answer) in enumerate(zip(with_answer_rows, no_answer_rows)):
+        where = f"{task_name}:{idx}:{with_answer.get('id', '?')}"
+        if set(no_answer) != ALLOWED_NO_ANSWER_KEYS:
+            raise ValidationError(f"{where}: no-answer keys are {sorted(no_answer)}")
+        expected = remove_answer(with_answer)
+        if no_answer != expected:
+            raise ValidationError(f"{where}: no-answer row differs beyond removed answer field")
+
+
 def run_generator(task: dict, n: int, source_dir: Path, seed: int) -> str:
     out_path = source_dir / task["source"]
     cmd = [
@@ -305,6 +346,7 @@ def build(args: argparse.Namespace) -> None:
     for task in TASKS:
         source_path = source_dir / task["source"]
         out_path = out_dir / task["out"]
+        final_with_answers_path, final_no_answers_path = final_paths(out_dir, task["out"])
         last_error = ""
         attempts = 1 if args.skip_generate else args.seed_attempts
         for offset in range(attempts):
@@ -329,8 +371,20 @@ def build(args: argparse.Namespace) -> None:
                 continue
 
             write_jsonl(out_path, clean_rows)
+            write_jsonl(final_with_answers_path, clean_rows)
+            no_answer_rows = [remove_answer(ex) for ex in clean_rows]
+            validate_no_answer(clean_rows, no_answer_rows, task_name=task["name"])
+            write_jsonl(final_no_answers_path, no_answer_rows)
+
             reread = read_jsonl(out_path)
+            reread_with_answers = read_jsonl(final_with_answers_path)
+            reread_no_answers = read_jsonl(final_no_answers_path)
             validate_clean(reread, task_name=task["name"], expected_n=args.n)
+            validate_clean(reread_with_answers, task_name=task["name"], expected_n=args.n)
+            validate_no_answer(reread_with_answers, reread_no_answers, task_name=task["name"])
+
+            clean_stats["final_with_answers"] = str(final_with_answers_path.relative_to(PROJECT_ROOT))
+            clean_stats["final_no_answers"] = str(final_no_answers_path.relative_to(PROJECT_ROOT))
             summary[task["out"]] = clean_stats
             source_label = "existing source" if args.skip_generate else f"seed {seed}"
             print(f"{task['name']}: clean export passed with {source_label}", flush=True)

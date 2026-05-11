@@ -10,12 +10,9 @@ from .entities import Environment
 
 POSITION_LABELS: dict[str, str] = {
     # Multi-lane positions
-    "left_shoulder":       "the left shoulder",
-    "far_left_lane":        "the far-left lane",
-    "left_center_lane":     "the left-center lane",
-    "right_center_lane":    "the right-center lane",
-    "far_right_lane":       "the far-right lane",
-    "right_shoulder":       "the right shoulder",
+    "left_lane":            "the left lane",
+    "center_lane":          "the center lane",
+    "right_lane":           "the right lane",
     # Roundabout internal position
     "roundabout_lane":      "the roundabout lane",
     # Intersection body (logical "inside" state)
@@ -40,12 +37,9 @@ _INTERSECTION_POSITIONS = (
 )
 
 _MULTI_LANE_POSITIONS = (
-    "left_shoulder",
-    "far_left_lane",
-    "left_center_lane",
-    "right_center_lane",
-    "far_right_lane",
-    "right_shoulder",
+    "left_lane",
+    "center_lane",
+    "right_lane",
 )
 
 _ROUNDABOUT_POSITIONS = (

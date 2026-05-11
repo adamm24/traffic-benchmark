@@ -13,12 +13,15 @@ Task 3 evaluates violation detection in event sequences. It builds on Task 1 sta
 
 The model receives a scenario with 3 vehicles and a short sequence of 2–3 events, and must identify which vehicle committed the first illegal action — or determine that no violation occurred. This combines two sub-skills: applying domain traffic rules to individual actions (rule lookup) and correctly attributing the first violation to the right actor across a multi-event trace (temporal grounding).
 
+Canonical question text in each record:
+- `Which vehicle performs the first illegal action?`
+
 Task 3 uses all three environments:
 - `intersection` — FSM-based movement through approach → inside → exit; violations include turning without entering, moving forward from an exit lane, and right-of-way infractions
 - `multi_lane_road` — three lateral lanes; violations are lane changes out of bounds (left from left_lane, right from right_lane)
 - `roundabout` — rotary; violation is entering without yielding to a circulating vehicle
 
-The fixed 5-option answer set has a specific semantic structure: three vehicle labels (A, B, C), one "no violation" option ("No vehicle can be determined"), and one deliberate distractor ("Another vehicle (not A, B, or C)") which is never correct. This fifth option tests whether the model confuses the possibility of unspecified actors with the observable facts in the scenario.
+The fixed 5-option answer set has a specific semantic structure: three vehicle labels (A, B, C), one no-violation option ("No vehicle performed an illegal action"), and one deliberate distractor ("Another vehicle (not A, B, or C)") which is never correct. This fifth option tests whether the model confuses the possibility of unspecified actors with the observable facts in the scenario.
 
 ---
 
@@ -80,7 +83,7 @@ Difficulty is derived from two structural properties: the total number of events
 
 The 5-option answer set is fixed semantically across all records:
 - `near_true` — the two non-violating vehicle labels. Since any of A, B, or C can be the violator, the other two are the most plausible wrong answers.
-- `highly_false` — "No vehicle can be determined" (wrong when a violation exists) and "Another vehicle (not A, B, or C)" (always wrong — no fourth vehicle is ever present).
+- `highly_false` — "No vehicle performed an illegal action" (wrong when a violation exists) and "Another vehicle (not A, B, or C)" (always wrong — no fourth vehicle is ever present).
 
 The key schedule permutes which letter maps to which semantic position, so that the correct answer is distributed uniformly.
 
@@ -94,7 +97,7 @@ Every example is verified through a deterministic replay: the generator re-simul
 | `fixed_option_set` | The 5 choices are exactly the expected semantic labels |
 | `answer_in_choices` | The correct answer letter is present in the choices |
 | `correct_vehicle_not_missing_from_choices` | The violating vehicle label appears in the choices |
-| `undetermined_correct_only_for_no_violation` | "No vehicle can be determined" is correct only for no_violation records |
+| `undetermined_correct_only_for_no_violation` | "No vehicle performed an illegal action" is correct only for no_violation records |
 | `violation_step_none_only_for_no_violation` | `violation_step` is None only for no_violation records |
 | `all_events_valid_format` | All event entries have the required fields |
 | `first_illegal_event_matches_metadata` | `metadata.violation_step` matches the replay's first illegal event index |

@@ -112,7 +112,7 @@ The FSM defines the vehicle lifecycle within each environment as explicit states
 
 ### State derivation
 
-`derive_state(v, env)` maps the current `position` and `inside_intersection` fields to a `VehicleState`. This function is used by `is_transition_applicable()` before each action to check validity.
+`derive_state(v, env)` maps the current `position` and `inside_intersection` fields to a `VehicleState`. `is_transition_applicable()` uses it before each action to check validity.
 
 ### Transition table
 

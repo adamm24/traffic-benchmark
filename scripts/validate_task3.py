@@ -17,12 +17,14 @@ from domain.scenario import apply_action
 
 
 LETTERS = ("A", "B", "C", "D", "E")
+NO_VIOLATION_OPTION = "No vehicle performed an illegal action"
+QUESTION_TEXT = "Which vehicle performs the first illegal action?"
 
 FIXED_OPTIONS = {
     "Vehicle A",
     "Vehicle B",
     "Vehicle C",
-    "No vehicle can be determined",
+    NO_VIOLATION_OPTION,
     "Another vehicle (not A, B, or C)",
 }
 
@@ -147,13 +149,18 @@ def replay_first_violation(example: dict) -> ReplayResult:
 
 def _semantic_from_replay(replay: ReplayResult) -> str:
     if not replay.has_violation:
-        return "No vehicle can be determined"
+        return NO_VIOLATION_OPTION
     return f"Vehicle {replay.violation_vehicle}"
 
 
 def validate_example(example: dict) -> tuple[bool, bool, str, ReplayResult]:
     choices = example.get("choices", {})
     answer = example.get("answer")
+    question = example.get("question")
+
+    if question != QUESTION_TEXT:
+        replay = replay_first_violation(example)
+        return False, True, "question text mismatch", replay
 
     if sorted(choices.keys()) != list(LETTERS):
         replay = replay_first_violation(example)
@@ -263,7 +270,7 @@ def validate_file(path: Path) -> int:
             if len(set(choices.values())) != len(choices.values()):
                 totals.duplicate_option_texts += 1
             for letter, text in choices.items():
-                if text == "No vehicle can be determined":
+                if text == NO_VIOLATION_OPTION:
                     undetermined_letter_counts[letter] += 1
                 if text == "Another vehicle (not A, B, or C)":
                     fifth_letter_counts[letter] += 1
@@ -288,7 +295,7 @@ def validate_file(path: Path) -> int:
             else:
                 violation_seq_len_counts[seq_len] += 1
 
-            if choices.get(answer) == "No vehicle can be determined":
+            if choices.get(answer) == NO_VIOLATION_OPTION:
                 totals.undetermined_correct += 1
 
             if replay.has_violation:
@@ -403,7 +410,7 @@ def validate_file(path: Path) -> int:
         print(f"  {vclass} @ {env}: {c}")
 
     print("\nOption-position distribution:")
-    print("  No vehicle can be determined:")
+    print(f"  {NO_VIOLATION_OPTION}:")
     for k in LETTERS:
         print(f"    {k}: {undetermined_letter_counts[k]}")
     print("  Another vehicle (not A, B, or C):")

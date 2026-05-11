@@ -32,3 +32,6 @@ __pypackages__/
 
 # Local audit backup
 .de-ai-backup/
+
+# Evaluation outputs
+results/

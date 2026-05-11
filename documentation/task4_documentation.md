@@ -1,18 +1,28 @@
-# Task 4 Documentation — Overlap Reasoning
+# Task 4 Documentation — Certainty Under Spatial Ambiguity
 
-**Scope:** Core benchmark Task 4  
-**Generator:** `generators/task4_overlap.py` — version `task4_overlap_v6`  
-**Validators:** `scripts/validate_task4.py`, `scripts/validate_task4_distribution.py`  
-**Dataset:** `dataset/core/task4_overlap.jsonl`  
-**Last updated:** April 2026
+**Scope:** Core benchmark Task 4
+**Generator:** `generators/task4_overlap.py` — version `task4_certainty_ambiguity_v1`
+**Validators:** `scripts/validate_task4.py`, `scripts/validate_task4_distribution.py`
+**Dataset:** `dataset/core/task4_overlap.jsonl`
+**Last updated:** May 2026
 
 ---
 
-## 1. Context
+## 1. Task Definition
 
-Task 4 evaluates **epistemic certainty under partial spatial ambiguity**: when vehicles overlap inside an intersection or a roundabout, or when relative order on a multi-lane road is unspecified, the model must separate what is certainly derivable from what is only plausible.
+Task 4 evaluates **epistemic certainty under spatial ambiguity**: given a scenario and an event sequence, the model must identify which of five statements about vehicle positions is *certainly* true — provable from the observable sequence alone — and reject statements that are plausible but unverifiable.
 
-Unlike Tasks 1–3, options are full statements. Exactly one statement is certainly true; two are near-true (uncertain); two are highly-false (contradicted by replayed state).
+The core skill being tested is not positional tracking (Task 1) or rule compliance (Tasks 2–3), but **epistemic discrimination**: the ability to distinguish what can be proven from what can only be inferred or guessed. This requires reasoning about what the sequence does *not* tell you, not just what it does.
+
+Spatial ambiguity arises from multiple sources in this benchmark:
+
+- **Simultaneous presence in a shared zone** (intersection body, roundabout lane): when two vehicles are both inside, their relative positions — who is ahead, who is to the left — are not determined by the event log alone.
+- **Unknown entry/exit ordering**: when a vehicle is known not to have entered a zone, the sequence does not specify *when* it will enter relative to another vehicle's exit.
+- **Unspecified lane ordering on a multi-lane road**: a vehicle's lane is known, but its longitudinal position relative to other vehicles in other lanes is not observable from lane-change events alone.
+
+Overlap between vehicles is one mechanism that produces spatial ambiguity, but it is not the defining feature of the task. The task is defined by the epistemic challenge — certainty under ambiguity — and overlap is simply one of several scenarios that create that challenge.
+
+Unlike Tasks 1–3, options are full declarative statements rather than position labels or vehicle identifiers. Exactly one statement is certainly true; two are near-true (uncertain given the sequence); two are highly-false (contradicted by the replayed final state).
 
 ---
 
@@ -24,9 +34,9 @@ Given scenario + event sequence, the model must answer:
 
 Required behavior:
 - track all vehicles through events
-- identify one provable statement
-- reject uncertain overlap-ordering statements
-- reject contradictory state statements
+- identify one statement that is provably true given the sequence
+- reject statements that are uncertain due to spatial ambiguity
+- reject statements that are contradicted by the replayed state
 
 ---
 
@@ -37,13 +47,13 @@ Required behavior:
 `generators/task4_overlap.py` implements:
 - deterministic generation (`--seed`) with fixed schedules
 - 100-example core set with exact key balance (`20 x A/B/C/D/E`)
-- scenario schedule with six structural types:
-  - `two_overlap_one_outside` (20)
-  - `two_overlap_third_exited` (10)
-  - `one_inside_one_exited_one_approach` (20)
-  - `roundabout_overlap` (20)
-  - `roundabout_non_entry` (10)
-  - `multi_lane_positioning` (20)
+- scenario schedule with six structural types, each corresponding to a distinct source of spatial ambiguity:
+  - `two_overlap_one_outside` (20) — ambiguity from simultaneous presence in intersection
+  - `two_overlap_third_exited` (10) — ambiguity from simultaneous presence, third vehicle exited
+  - `one_inside_one_exited_one_approach` (20) — ambiguity from unknown entry/exit ordering
+  - `roundabout_overlap` (20) — ambiguity from simultaneous presence in roundabout
+  - `roundabout_non_entry` (10) — ambiguity from unknown roundabout entry timing
+  - `multi_lane_positioning` (20) — ambiguity from unobservable longitudinal lane ordering
 - environment split:
   - `intersection` 50
   - `roundabout` 30
@@ -59,19 +69,20 @@ Required behavior:
   - `roundabout_overlap` 20
   - `lane_position` 20
 
-### 3.2 Statement taxonomy (v6)
+### 3.2 Statement taxonomy
 
-Near-true statements use five epistemic types:
-- **spatial_present**: `"Vehicle X is ahead of Vehicle Y."` / `"Vehicle X is to the left of Vehicle Y."` (current overlap-state)
-- **moved_past**: `"Vehicle X has already moved past Vehicle Y."` (relative position during simultaneous presence)
-- **past_overlap**: `"Vehicle X was ahead of Vehicle Y inside the intersection."` / `"was to the left of"` (past-tense overlap uncertainty; pair-specific replay-checked)
-- **will_future**: `"Vehicle X will exit before Vehicle Y enters the intersection."` etc.
-- **lane_order_unknown**: `"Vehicle X is ahead of Vehicle Y on the road."` / `"is behind"` / `"is directly behind"` / `"has already moved past"` / `"will change lanes before"` for `multi_lane_road`
+Near-true statements cover five distinct epistemic types, each corresponding to a different reason why a statement about vehicle positions cannot be confirmed from the observable sequence:
 
-Correct-answer phrasing was also widened to reduce exact-text reuse:
-- pair-containment variants now include `"Both Vehicle X and Vehicle Y are inside the intersection."`
-- single-vehicle containment variants now include `"Vehicle X remains inside the intersection."`
-- equivalent variants exist for roundabout overlap
+- **spatial_present**: `"Vehicle X is ahead of Vehicle Y."` / `"Vehicle X is to the left of Vehicle Y."` — relative ordering inside a shared zone is unspecified
+- **moved_past**: `"Vehicle X has already moved past Vehicle Y."` — relative position during simultaneous presence cannot be recovered from event order alone
+- **past_overlap**: `"Vehicle X was ahead of Vehicle Y inside the intersection."` — past-tense ordering inside a shared zone; pair-specific, replay-checked
+- **will_future**: `"Vehicle X will exit before Vehicle Y enters the intersection."` — future ordering cannot be derived from the given sequence
+- **lane_order_unknown**: `"Vehicle X is ahead of Vehicle Y on the road."` / `"is behind"` / `"is directly behind"` / `"has already moved past"` / `"will change lanes before"` — longitudinal ordering on a multi-lane road is not determined by lane-change events
+
+Correct-answer phrasing uses multiple variants to reduce exact-text reuse:
+- pair-containment variants include both `"Vehicles X and Y are both inside the intersection."` and `"Both Vehicle X and Vehicle Y are inside the intersection."`
+- single-vehicle containment variants include both `"Vehicle X is inside the intersection."` and `"Vehicle X remains inside the intersection."`
+- equivalent variants exist for roundabout scenarios
 
 Scale-up safeguards:
 - single-vehicle correct answers are balanced during generation with a soft gap cap
@@ -89,7 +100,7 @@ Per-example hard gate includes:
 4. five distinct statements
 5. no cross-environment position labels
 6. replay matches `audit.final_state`
-7. overlap detected, except categories that are valid without overlap (`containment_non_entry`, `lane_position`)
+7. spatial ambiguity condition met: either replayed overlap exists, or the example belongs to a non-overlap ambiguity category (`containment_non_entry`, `lane_position`)
 8. at least two acting vehicles
 9. no action streak length 3
 10. no ABAB actor pattern
@@ -130,13 +141,15 @@ Global dedup caps:
 
 ---
 
-## 5. Known Limitations
+## 5. Design Notes
 
-**Vocabulary gap for multi-lane positions.** `domain/scenario.py` uses `left_lane`, `center_lane`, and `right_lane` as position keys for `multi_lane_road`, but `domain/vocabulary.py` does not provide human-readable labels for these three strings. Task 4 handles this with a local mapping inside the generator: `left_lane → the left lane`, etc. No modifications were made to `domain/`. This gap is also documented in `domain_documentation.md`.
+**File and dataset naming.** The generator (`task4_overlap.py`) and dataset (`task4_overlap.jsonl`) retain names from an earlier version of the project. These names are preserved deliberately to maintain pipeline stability and avoid reference breakage across validators, scripts, and reproducibility records. The task definition and all semantic identifiers (`TASK_NAME`, `GENERATOR_VERSION`, question wording, category labels) use the current definition: certainty under spatial ambiguity.
+
+**Multi-lane vocabulary.** `domain/scenario.py` uses `left_lane`, `center_lane`, and `right_lane` as position keys for `multi_lane_road`, but `domain/vocabulary.py` does not expose human-readable labels for these strings. Task 4 resolves this with a local mapping inside the generator (`left_lane → the left lane`, etc.). No modifications were made to `domain/`. This is documented in `domain_documentation.md`.
 
 ---
 
-## 6. Final Validation Status (Core-100, v6)
+## 6. Final Validation Status (Core-100, v1)
 
 Command:
 
@@ -181,6 +194,6 @@ diff /tmp/run1_task4.jsonl /tmp/run2_task4.jsonl
 
 ## 7. Summary
 
-The core dataset consists of 100 examples, all validated to zero errors by the independent validator. The generator and validator are deterministic given a fixed seed. All balance, overlap, uncertainty, and anti-shortcut constraints are satisfied.
+Task 4 evaluates certainty under spatial ambiguity: the ability to identify what is provably true about vehicle positions when the event sequence leaves some spatial relationships undetermined. The task is designed around the epistemic gap between what is observable and what is certain — a property that arises in multiple distinct spatial configurations, of which simultaneous zone occupancy (overlap) is one.
 
-The main design challenge was constructing near-true statements that are genuinely uncertain rather than just plausible. The five epistemic statement types (spatial_present, moved_past, past_overlap, will_future, lane_order_unknown) capture distinct reasons why a statement about vehicle positions cannot be confirmed from the observable sequence alone.
+The core dataset consists of 100 examples spanning six scenario types and three environments, all validated to zero errors by the independent validator. The generator and validator are deterministic given a fixed seed. All balance, uncertainty classification, and anti-shortcut constraints are satisfied.

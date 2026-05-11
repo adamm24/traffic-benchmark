@@ -16,6 +16,8 @@ from domain.trajectory import trajectory_cells
 
 
 LETTERS = ("A", "B", "C", "D", "E")
+NO_CLEAR_OPTION_TEXT = "No vehicle has an unambiguous right of way"
+BOTH_OPTION_TEXT = "Both can pass at the same time"
 
 RIGHT_OF = {
     Direction.NORTH: Direction.EAST,
@@ -139,6 +141,58 @@ def _has_intent_sensitive_priority_pair(scenario_json: dict, priority: str) -> b
             continue
         if _direction_only_winner(pv, ov) != priority:
             return True
+    return False
+
+
+def _is_no_clear_four_way_straight(scenario_json: dict) -> bool:
+    if scenario_json.get("environment") != Environment.INTERSECTION.value:
+        return False
+    vehicles = scenario_json.get("vehicles", [])
+    if len(vehicles) != 4:
+        return False
+    directions = {v.get("direction") for v in vehicles}
+    if len(directions) != 4:
+        return False
+    for v in vehicles:
+        intent = (v.get("intent") or "").strip().lower()
+        if intent != IntentDirection.GO_STRAIGHT.value:
+            return False
+    return True
+
+
+def _is_no_clear_threeway_straight(scenario_json: dict) -> bool:
+    if scenario_json.get("environment") != Environment.INTERSECTION.value:
+        return False
+    vehicles = scenario_json.get("vehicles", [])
+    if len(vehicles) != 3:
+        return False
+    directions = {v.get("direction") for v in vehicles}
+    if len(directions) != 3:
+        return False
+    for v in vehicles:
+        intent = (v.get("intent") or "").strip().lower()
+        if intent != IntentDirection.GO_STRAIGHT.value:
+            return False
+    return True
+
+
+def _has_right_left_conflict_pair(scenario_json: dict) -> bool:
+    if scenario_json.get("environment") != Environment.INTERSECTION.value:
+        return False
+    vehicles = scenario_json.get("vehicles", [])
+    by_id = {v["id"]: v for v in vehicles if "id" in v}
+    ids = list(by_id.keys())
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            v1 = by_id[ids[i]]
+            v2 = by_id[ids[j]]
+            i1 = _parse_intent(v1.get("intent"))
+            i2 = _parse_intent(v2.get("intent"))
+            if {i1, i2} != {IntentDirection.TURN_LEFT, IntentDirection.TURN_RIGHT}:
+                continue
+            pr = _pair_intersection(v1, v2)
+            if pr.conflict and not pr.unsupported:
+                return True
     return False
 
 
@@ -309,59 +363,94 @@ def validate_example(example: dict) -> tuple[list[str], PriorityResult]:
 
     # independent recomputation
     recomputed = recompute_priority(example["scenario"])
-    if recomputed.priority is None:
-        errs.append(f"recompute failed: {recomputed.reason}")
-        return errs, recomputed
-
-    if answer in LETTERS:
-        answer_text = example["choices"][answer]
-        expected_answer = f"Vehicle {recomputed.priority}"
-        if answer_text != expected_answer:
-            errs.append(
-                f"gold mismatch: answer text {answer_text!r}, expected {expected_answer!r}"
-            )
-
+    answer_text = example.get("choices", {}).get(answer, "")
     meta = example.get("metadata", {})
-    if meta.get("priority_vehicle") != recomputed.priority:
-        errs.append(
-            f"metadata.priority_vehicle={meta.get('priority_vehicle')!r} "
-            f"!= recomputed {recomputed.priority!r}"
-        )
-    if meta.get("yielding_vehicle") != recomputed.yielding:
-        errs.append(
-            f"metadata.yielding_vehicle={meta.get('yielding_vehicle')!r} "
-            f"!= recomputed {recomputed.yielding!r}"
-        )
-    cp = sorted(meta.get("conflict_pair", []))
-    expected_cp = sorted([recomputed.priority, recomputed.yielding])
-    if cp != expected_cp:
-        errs.append(f"metadata.conflict_pair={cp!r} != expected {expected_cp!r}")
+    resolution = meta.get("resolution")
+    no_clear_mode = (
+        resolution == "intersection_no_clear"
+        or answer_text == NO_CLEAR_OPTION_TEXT
+    )
 
-    if example.get("scenario", {}).get("environment") == Environment.INTERSECTION.value:
-        intent_sensitive = _has_intent_sensitive_priority_pair(
-            example["scenario"], recomputed.priority
-        )
-        if not intent_sensitive:
-            errs.append("intersection example has no intent-sensitive priority pair")
-        expected_meta_flag = meta.get("intent_sensitive_priority_pair")
-        if expected_meta_flag is not None and bool(expected_meta_flag) != intent_sensitive:
+    if no_clear_mode:
+        subtype = meta.get("no_clear_subtype")
+        if answer_text != NO_CLEAR_OPTION_TEXT:
+            errs.append("no-clear example answer text mismatch")
+        if BOTH_OPTION_TEXT in example.get("choices", {}).values():
+            errs.append("'Both can pass at the same time' should not appear in no-clear mode")
+        if subtype == "straight":
+            if not _is_no_clear_four_way_straight(example.get("scenario", {})):
+                errs.append("no-clear straight example does not match 4-way straight structure")
+        elif subtype == "turnmix":
+            sc = example.get("scenario", {})
+            if sc.get("environment") != Environment.INTERSECTION.value or len(sc.get("vehicles", [])) != 4:
+                errs.append("no-clear turnmix example must be 4-vehicle intersection")
+            if not _has_right_left_conflict_pair(sc):
+                errs.append("no-clear turnmix example lacks right-vs-left conflict pair")
+        elif subtype == "threeway":
+            if not _is_no_clear_threeway_straight(example.get("scenario", {})):
+                errs.append("no-clear threeway example does not match 3-way straight structure")
+        else:
+            errs.append("no-clear example missing/invalid subtype")
+        if recomputed.priority is not None:
+            errs.append("no-clear example unexpectedly has a unique dominant priority")
+        if meta.get("priority_vehicle") is not None:
+            errs.append("metadata.priority_vehicle should be null in no-clear mode")
+        if meta.get("yielding_vehicle") is not None:
+            errs.append("metadata.yielding_vehicle should be null in no-clear mode")
+        if meta.get("conflict_pair"):
+            errs.append("metadata.conflict_pair should be empty in no-clear mode")
+    else:
+        if recomputed.priority is None:
+            errs.append(f"recompute failed: {recomputed.reason}")
+            return errs, recomputed
+        if answer in LETTERS:
+            expected_answer = f"Vehicle {recomputed.priority}"
+            if answer_text != expected_answer:
+                errs.append(
+                    f"gold mismatch: answer text {answer_text!r}, expected {expected_answer!r}"
+                )
+        if meta.get("priority_vehicle") != recomputed.priority:
             errs.append(
-                "metadata.intent_sensitive_priority_pair does not match recomputation"
+                f"metadata.priority_vehicle={meta.get('priority_vehicle')!r} "
+                f"!= recomputed {recomputed.priority!r}"
             )
-        direction_only_priority = _dominant_direction_only(example["scenario"])
-        if direction_only_priority == recomputed.priority:
-            errs.append("direction-only global heuristic matches priority")
-        expected_donly_meta = meta.get("direction_only_priority")
-        if expected_donly_meta is not None and expected_donly_meta != direction_only_priority:
-            errs.append("metadata.direction_only_priority does not match recomputation")
-        alpha_guess = _alphabetical_non_left_heuristic(example["scenario"])
-        if alpha_guess == recomputed.priority:
-            errs.append("alphabetical non-left heuristic matches priority")
+        if meta.get("yielding_vehicle") != recomputed.yielding:
+            errs.append(
+                f"metadata.yielding_vehicle={meta.get('yielding_vehicle')!r} "
+                f"!= recomputed {recomputed.yielding!r}"
+            )
+        cp = sorted(meta.get("conflict_pair", []))
+        expected_cp = sorted([recomputed.priority, recomputed.yielding])
+        if cp != expected_cp:
+            errs.append(f"metadata.conflict_pair={cp!r} != expected {expected_cp!r}")
+
+        if example.get("scenario", {}).get("environment") == Environment.INTERSECTION.value:
+            intent_sensitive = _has_intent_sensitive_priority_pair(
+                example["scenario"], recomputed.priority
+            )
+            if not intent_sensitive:
+                errs.append("intersection example has no intent-sensitive priority pair")
+            expected_meta_flag = meta.get("intent_sensitive_priority_pair")
+            if expected_meta_flag is not None and bool(expected_meta_flag) != intent_sensitive:
+                errs.append(
+                    "metadata.intent_sensitive_priority_pair does not match recomputation"
+                )
+            direction_only_priority = _dominant_direction_only(example["scenario"])
+            if direction_only_priority == recomputed.priority:
+                errs.append("direction-only global heuristic matches priority")
+            expected_donly_meta = meta.get("direction_only_priority")
+            if expected_donly_meta is not None and expected_donly_meta != direction_only_priority:
+                errs.append("metadata.direction_only_priority does not match recomputation")
 
     # non-triviality: require >=2 conflicting pairs
     conflict_count = sum(1 for p in recomputed.pairwise if p.conflict)
-    if conflict_count < 2:
-        errs.append(f"too few conflict pairs: {conflict_count}")
+    if no_clear_mode:
+        min_conflicts = 2 if meta.get("no_clear_subtype") == "threeway" else 4
+        if conflict_count < min_conflicts:
+            errs.append(f"too few conflict pairs for no-clear mode: {conflict_count}")
+    else:
+        if conflict_count < 2:
+            errs.append(f"too few conflict pairs: {conflict_count}")
 
     return errs, recomputed
 
@@ -394,15 +483,23 @@ def main() -> int:
     answer_counts: Counter[str] = Counter()
     env_counts: Counter[str] = Counter()
     priority_counts: Counter[str] = Counter()
+    resolution_counts: Counter[str] = Counter()
     question_counts: Counter[str] = Counter()
     context_counts: Counter[str] = Counter()
     choice_text_counts: Counter[str] = Counter()
+    correct_text_counts: Counter[str] = Counter()
     conflict_count_dist: Counter[int] = Counter()
+    no_clear_vehicle_counts: Counter[int] = Counter()
 
     with_both_phrase = 0
+    both_by_letter: Counter[str] = Counter()
     intersection_total = 0
+    intersection_unique_total = 0
+    intersection_unique_priority_counts: Counter[str] = Counter()
+    intersection_role_pattern_counts: Counter[tuple[tuple[str, str, str], ...]] = Counter()
     direction_only_correct = 0
     alpha_non_left_correct = 0
+    distractor_letter_counts: Counter[str] = Counter()
     failed_records: list[tuple[str, list[str]]] = []
 
     with path.open(encoding="utf-8") as f:
@@ -430,18 +527,45 @@ def main() -> int:
             context_counts[_context_from_prompt(ex.get("prompt", ""))] += 1
             for txt in ex.get("choices", {}).values():
                 choice_text_counts[txt] += 1
-            if "Both can pass at the same time" in ex.get("choices", {}).values():
+            if ex.get("answer") in LETTERS:
+                correct_text_counts[ex["choices"][ex["answer"]]] += 1
+            if BOTH_OPTION_TEXT in ex.get("choices", {}).values():
                 with_both_phrase += 1
+                for letter, text in ex.get("choices", {}).items():
+                    if text == BOTH_OPTION_TEXT:
+                        both_by_letter[letter] += 1
+                        break
+            for letter in LETTERS:
+                if letter != ex.get("answer"):
+                    distractor_letter_counts[letter] += 1
+            resolution = ex.get("metadata", {}).get("resolution", "unique_priority")
+            resolution_counts[resolution] += 1
+            if resolution == "intersection_no_clear":
+                no_clear_vehicle_counts[len(ex.get("scenario", {}).get("vehicles", []))] += 1
             if env == Environment.INTERSECTION.value:
                 intersection_total += 1
-                direction_only_guess = _dominant_direction_only(ex["scenario"])
-                if direction_only_guess is not None:
-                    if ex["choices"].get(ex.get("answer")) == f"Vehicle {direction_only_guess}":
-                        direction_only_correct += 1
-                alpha_guess = _alphabetical_non_left_heuristic(ex["scenario"])
-                if alpha_guess is not None:
-                    if ex["choices"].get(ex.get("answer")) == f"Vehicle {alpha_guess}":
-                        alpha_non_left_correct += 1
+                if resolution != "intersection_no_clear":
+                    intersection_unique_total += 1
+                    direction_only_guess = _dominant_direction_only(ex["scenario"])
+                    if direction_only_guess is not None:
+                        if ex["choices"].get(ex.get("answer")) == f"Vehicle {direction_only_guess}":
+                            direction_only_correct += 1
+                    alpha_guess = _alphabetical_non_left_heuristic(ex["scenario"])
+                    if alpha_guess is not None:
+                        if ex["choices"].get(ex.get("answer")) == f"Vehicle {alpha_guess}":
+                            alpha_non_left_correct += 1
+                    ans_text = ex["choices"].get(ex.get("answer"), "")
+                    if ans_text.startswith("Vehicle "):
+                        intersection_unique_priority_counts[ans_text.split(" ", 1)[1]] += 1
+                    pattern = tuple(sorted(
+                        (
+                            str(v.get("id")),
+                            str(v.get("direction")),
+                            str(v.get("intent")),
+                        )
+                        for v in ex.get("scenario", {}).get("vehicles", [])
+                    ))
+                    intersection_role_pattern_counts[pattern] += 1
 
             errs, recomputed = validate_example(ex)
             if recomputed.priority is not None:
@@ -457,6 +581,7 @@ def main() -> int:
 
     print("\nDistribution checks:")
     print("  Environment:", dict(sorted(env_counts.items())))
+    print("  Resolution:", dict(sorted(resolution_counts.items())))
     print("  Answer letters:", dict(sorted(answer_counts.items())))
     print("  Recomputed priority vehicle:", dict(sorted(priority_counts.items())))
     print("  Pair-conflict-count:", dict(sorted(conflict_count_dist.items())))
@@ -488,16 +613,16 @@ def main() -> int:
         f"  'Both can pass at the same time' appears in {with_both_phrase}/{total} "
         f"examples ({both_ratio:.1f}%)."
     )
-    if intersection_total:
-        donly_acc = direction_only_correct / intersection_total * 100.0
+    if intersection_unique_total:
+        donly_acc = direction_only_correct / intersection_unique_total * 100.0
         print(
             f"  Direction-only intersection heuristic accuracy: "
-            f"{direction_only_correct}/{intersection_total} ({donly_acc:.1f}%)."
+            f"{direction_only_correct}/{intersection_unique_total} ({donly_acc:.1f}%)."
         )
-        alpha_acc = alpha_non_left_correct / intersection_total * 100.0
+        alpha_acc = alpha_non_left_correct / intersection_unique_total * 100.0
         print(
             f"  Alphabetical non-left heuristic accuracy: "
-            f"{alpha_non_left_correct}/{intersection_total} ({alpha_acc:.1f}%)."
+            f"{alpha_non_left_correct}/{intersection_unique_total} ({alpha_acc:.1f}%)."
         )
     roundabout_total = env_counts.get(Environment.ROUNDABOUT.value, 0)
     if total:
@@ -512,7 +637,48 @@ def main() -> int:
         for ex_id, errs in failed_records[: max(0, args.show_fails)]:
             print(f"  [FAIL {ex_id}] {errs[0]}")
 
-    return 0 if failed == 0 else 1
+    quality_issues: list[str] = []
+    if total and total % len(LETTERS) == 0:
+        expected_per_letter = total // len(LETTERS)
+        for letter in LETTERS:
+            if answer_counts.get(letter, 0) != expected_per_letter:
+                quality_issues.append(
+                    f"answer letter imbalance: {letter}={answer_counts.get(letter, 0)} "
+                    f"(expected {expected_per_letter})"
+                )
+
+    if intersection_unique_total:
+        if len(intersection_unique_priority_counts) < 2:
+            quality_issues.append("intersection unique-priority answers collapse to <2 vehicles")
+        max_v = max(intersection_unique_priority_counts.values(), default=0)
+        if max_v > int(0.70 * intersection_unique_total):
+            quality_issues.append("intersection unique-priority vehicle imbalance too high")
+
+    if intersection_role_pattern_counts:
+        top_pattern = max(intersection_role_pattern_counts.values())
+        if top_pattern > int(0.35 * max(1, intersection_unique_total)):
+            quality_issues.append("repeated role-label pattern overuse detected")
+
+    if total:
+        max_correct = max(correct_text_counts.values(), default=0)
+        if max_correct > int(0.55 * total):
+            quality_issues.append("overuse of the same literal correct answer text")
+
+    if resolution_counts.get("intersection_no_clear", 0) > 0:
+        if sum(no_clear_vehicle_counts.values()) > 0 and len(no_clear_vehicle_counts) == 1 and 4 in no_clear_vehicle_counts:
+            quality_issues.append("no-clear answer remains perfectly correlated with 4-vehicle cases")
+
+    if both_by_letter:
+        vals = [both_by_letter.get(letter, 0) for letter in LETTERS]
+        if max(vals) - min(vals) > 12:
+            quality_issues.append("'Both can pass...' shows distractor-letter bias")
+
+    if quality_issues:
+        print("\nQuality gate failures:")
+        for issue in quality_issues:
+            print(f"  - {issue}")
+
+    return 0 if (failed == 0 and not quality_issues) else 1
 
 
 if __name__ == "__main__":

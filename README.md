@@ -8,7 +8,7 @@ Completed in this repository:
 - Task 1: position tracking (`dataset/core/task1_position.jsonl`)
 - Task 2: right-of-way reasoning (`dataset/core/task2_rightofway.jsonl`)
 - Task 3: violation detection (`dataset/core/task3_violation.jsonl`)
-- Task 4: overlap reasoning (`dataset/core/task4_overlap.jsonl`)
+- Task 4: certainty under spatial ambiguity (`dataset/core/task4_overlap.jsonl`)
 - Validators and quality checks for Tasks 2–4
 
 ## Repository Entry Points
