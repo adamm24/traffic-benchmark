@@ -126,6 +126,19 @@ NO_VIOLATION_ENVS = [
 ]
 
 
+def _event_signature_reuse_cap_for_n(n: int) -> int:
+    # Keep strict uniqueness for core-sized builds, relax slightly for larger builds.
+    return EVENT_SIGNATURE_REUSE_CAP if n <= 100 else 2
+
+
+def _action_pattern_reuse_cap_for_n(n: int) -> int:
+    return ACTION_PATTERN_REUSE_CAP if n <= 100 else 3
+
+
+def _max_action_pattern_reuse_total_for_n(n: int) -> int:
+    return MAX_ACTION_PATTERN_REUSE_TOTAL if n <= 100 else max(45, n // 5)
+
+
 
 
 def _semantic_for_vehicle(vid: str) -> str:
@@ -1696,7 +1709,13 @@ def generate_example(
 
 
 
-def _assert_dataset_quality(examples: list[dict]) -> None:
+def _assert_dataset_quality(
+    examples: list[dict],
+    *,
+    event_signature_reuse_cap: int,
+    action_pattern_reuse_cap: int,
+    max_action_pattern_reuse_total: int,
+) -> None:
     if not examples:
         raise RuntimeError("empty dataset")
 
@@ -1800,7 +1819,7 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
     max_repeat = max(sequence_counts.values()) if sequence_counts else 0
     if repeated_count > int(0.18 * n):
         raise RuntimeError("too many repeated event-sequence templates")
-    if max_repeat > EVENT_SIGNATURE_REUSE_CAP:
+    if max_repeat > event_signature_reuse_cap:
         raise RuntimeError("event-sequence repeat cap exceeded")
 
     action_pattern_counts = Counter(
@@ -1808,13 +1827,13 @@ def _assert_dataset_quality(examples: list[dict]) -> None:
         for ex in examples
     )
     max_action_repeat = max(action_pattern_counts.values()) if action_pattern_counts else 0
-    if max_action_repeat > ACTION_PATTERN_REUSE_CAP:
+    if max_action_repeat > action_pattern_reuse_cap:
         raise RuntimeError("action-pattern single-pattern repeat cap exceeded")
     total_affected = sum(c for c in action_pattern_counts.values() if c > 1)
-    if total_affected > MAX_ACTION_PATTERN_REUSE_TOTAL:
+    if total_affected > max_action_pattern_reuse_total:
         raise RuntimeError(
             f"too many records share an action pattern: {total_affected} > "
-            f"{MAX_ACTION_PATTERN_REUSE_TOTAL}"
+            f"{max_action_pattern_reuse_total}"
         )
 
     difficulty_counts = Counter(ex["metadata"].get("difficulty") for ex in examples)
@@ -1880,9 +1899,12 @@ def _action_pattern_total_affected(action_pattern_usage: Counter[str]) -> int:
 def _action_pattern_would_exceed_caps(
     action_pattern_usage: Counter[str],
     action_pattern: str,
+    *,
+    action_pattern_reuse_cap: int,
+    max_action_pattern_reuse_total: int,
 ) -> bool:
     current = action_pattern_usage[action_pattern]
-    if current >= ACTION_PATTERN_REUSE_CAP:
+    if current >= action_pattern_reuse_cap:
         return True
 
     total_affected = _action_pattern_total_affected(action_pattern_usage)
@@ -1894,16 +1916,21 @@ def _action_pattern_would_exceed_caps(
     else:
         next_total = total_affected + 1
 
-    return next_total > MAX_ACTION_PATTERN_REUSE_TOTAL
+    return next_total > max_action_pattern_reuse_total
 
 
-def _blocked_action_patterns(action_pattern_usage: Counter[str]) -> set[str]:
+def _blocked_action_patterns(
+    action_pattern_usage: Counter[str],
+    *,
+    action_pattern_reuse_cap: int,
+    max_action_pattern_reuse_total: int,
+) -> set[str]:
     blocked = {
         pattern
         for pattern, count in action_pattern_usage.items()
-        if count >= ACTION_PATTERN_REUSE_CAP
+        if count >= action_pattern_reuse_cap
     }
-    if _action_pattern_total_affected(action_pattern_usage) >= MAX_ACTION_PATTERN_REUSE_TOTAL:
+    if _action_pattern_total_affected(action_pattern_usage) >= max_action_pattern_reuse_total:
         blocked.update(action_pattern_usage.keys())
     return blocked
 
@@ -1914,14 +1941,16 @@ def _difficulty_range_feasible(
     remaining_slots_after: int,
     n: int,
 ) -> bool:
-    if n != 100:
-        return True
+    targets = _build_difficulty_quota(n)
+    tolerance = max(2, n // 30)
     projected = Counter(difficulty_counts)
     projected[accepted_tier] += 1
     for tier in DIFFICULTIES:
         low = projected[tier]
         high = projected[tier] + remaining_slots_after
-        if high < 30 or low > 37:
+        min_allowed = max(0, targets[tier] - tolerance)
+        max_allowed = targets[tier] + tolerance
+        if high < min_allowed or low > max_allowed:
             return False
     return True
 
@@ -1946,7 +1975,10 @@ def generate_task3(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
     slot_retries = MAX_RETRIES
     slot_attempt_budget = min(slot_retries, MAX_SLOT_ATTEMPTS_SOFT_CAP)
     early_fallback_attempts = min(slot_attempt_budget, SLOT_EARLY_FALLBACK_ATTEMPTS)
-    max_difficulty_fallback = max(1, n // 20)
+    max_difficulty_fallback = max(1, n // 20) if n <= 100 else 0
+    event_signature_reuse_cap = _event_signature_reuse_cap_for_n(n)
+    action_pattern_reuse_cap = _action_pattern_reuse_cap_for_n(n)
+    max_action_pattern_reuse_total = _max_action_pattern_reuse_total_for_n(n)
     examples: list[dict] = []
     difficulty_fallback_used = 0
     last_error = "generation failed"
@@ -2069,7 +2101,16 @@ def generate_task3(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                         difficulty_env_targets,
                         allow_overquota=False,
                     )
-                    blocked_action_patterns = _blocked_action_patterns(action_pattern_usage)
+                    blocked_action_patterns = _blocked_action_patterns(
+                        action_pattern_usage,
+                        action_pattern_reuse_cap=action_pattern_reuse_cap,
+                        max_action_pattern_reuse_total=max_action_pattern_reuse_total,
+                    )
+                    blocked_event_signatures = {
+                        sig
+                        for sig, count in event_signature_usage.items()
+                        if count >= event_signature_reuse_cap
+                    }
                     difficulty_hint = desired_difficulty
                     if _attempt_i >= int(0.90 * slot_attempt_budget):
                         difficulty_hint = None
@@ -2084,7 +2125,7 @@ def generate_task3(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                             violation_class=None,
                             no_violation_env=env_hint,
                             desired_difficulty=difficulty_hint,
-                            forbidden_event_signatures=set(event_signature_usage.keys()),
+                            forbidden_event_signatures=blocked_event_signatures,
                             forbidden_action_patterns=blocked_action_patterns,
                         )
                         _perf_end("generate_examples", gen_t0)
@@ -2103,7 +2144,7 @@ def generate_task3(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                             violation_class=violation_class,
                             no_violation_env=None,
                             desired_difficulty=difficulty_hint,
-                            forbidden_event_signatures=set(event_signature_usage.keys()),
+                            forbidden_event_signatures=blocked_event_signatures,
                             forbidden_action_patterns=blocked_action_patterns,
                         )
                         _perf_end("generate_examples", gen_t0)
@@ -2120,12 +2161,17 @@ def generate_task3(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                         _perf_end("uniqueness_checks", uniq_t0)
                         continue
                     signature = _event_signature_from_plan(candidate["event_plan"])
-                    if event_signature_usage[signature] >= EVENT_SIGNATURE_REUSE_CAP:
+                    if event_signature_usage[signature] >= event_signature_reuse_cap:
                         batch_rejection_reasons["event_signature_cap"] += 1
                         _perf_end("uniqueness_checks", uniq_t0)
                         continue
                     action_pattern = "|".join(step["action"] for step in candidate["event_plan"])
-                    if _action_pattern_would_exceed_caps(action_pattern_usage, action_pattern):
+                    if _action_pattern_would_exceed_caps(
+                        action_pattern_usage,
+                        action_pattern,
+                        action_pattern_reuse_cap=action_pattern_reuse_cap,
+                        max_action_pattern_reuse_total=max_action_pattern_reuse_total,
+                    ):
                         batch_rejection_reasons["action_pattern_cap"] += 1
                         _perf_end("uniqueness_checks", uniq_t0)
                         continue
@@ -2335,7 +2381,12 @@ def generate_task3(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                 continue
 
         try:
-            _assert_dataset_quality(examples)
+            _assert_dataset_quality(
+                examples,
+                event_signature_reuse_cap=event_signature_reuse_cap,
+                action_pattern_reuse_cap=action_pattern_reuse_cap,
+                max_action_pattern_reuse_total=max_action_pattern_reuse_total,
+            )
         except RuntimeError as exc:
             last_error = (
                 f"dataset quality gate failed "
@@ -2360,9 +2411,9 @@ def generate_task3(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
         "events_min": 1,
         "events_max": 3,
         "no_violation_target_ratio": 0.20,
-        "event_signature_reuse_cap": EVENT_SIGNATURE_REUSE_CAP,
-        "action_pattern_reuse_cap": ACTION_PATTERN_REUSE_CAP,
-        "max_action_pattern_reuse_total": MAX_ACTION_PATTERN_REUSE_TOTAL,
+        "event_signature_reuse_cap": event_signature_reuse_cap,
+        "action_pattern_reuse_cap": action_pattern_reuse_cap,
+        "max_action_pattern_reuse_total": max_action_pattern_reuse_total,
         "max_slot_attempts_soft_cap": slot_attempt_budget,
         "slot_early_fallback_attempts": early_fallback_attempts,
         "high_attempt_slot_threshold": HIGH_ATTEMPT_SLOT_THRESHOLD,

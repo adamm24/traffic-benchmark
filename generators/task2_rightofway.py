@@ -384,6 +384,7 @@ def _relabel_intersection_for_anti_shortcut(
     state: ScenarioState,
     priority_label_usage: Counter[str],
     desired_priority_label: str,
+    desired_conflict_pair: str | None = None,
 ) -> tuple[ScenarioState, PriorityDerivation] | None:
     """
     Finds an ID relabeling (A/B/C permutation) that:
@@ -406,8 +407,12 @@ def _relabel_intersection_for_anti_shortcut(
             continue
 
         priority_vid = derived[0]
+        yielding_vid = derived[1]
         if priority_vid != desired_priority_label:
             continue
+        if desired_conflict_pair is not None:
+            if "-".join(sorted([priority_vid, yielding_vid])) != desired_conflict_pair:
+                continue
         alpha_hit = int(_alphabetical_non_left_heuristic(trial) == priority_vid)
 
         score = (
@@ -448,6 +453,14 @@ def _relabel_roundabout_for_priority_balance(
     for v in relabeled.vehicles:
         v.id = old_to_new[v.id]
     return relabeled
+
+
+def _roundabout_conflict_pair_from_priority_label(priority_label: str) -> str:
+    # With one inside winner + two entering vehicles, yielding tie-break is alphabetical.
+    # Therefore pair is deterministic given winner label.
+    if priority_label in {"A", "B"}:
+        return "A-B"
+    return "A-C"
 
 
 def _build_env_schedule(n: int) -> list[Environment]:
@@ -536,6 +549,35 @@ def _build_priority_schedule(mode_schedule: list[str]) -> list[str]:
         labels[i] = label
         usage[label] += 1
     return labels
+
+
+def _build_pair_targets(total: int, pair_keys: list[str]) -> dict[str, int]:
+    if total <= 0:
+        return {k: 0 for k in pair_keys}
+    base = total // len(pair_keys)
+    rem = total % len(pair_keys)
+    out = {k: base for k in pair_keys}
+    for i, k in enumerate(pair_keys):
+        if i < rem:
+            out[k] += 1
+    return out
+
+
+def _pick_underused_pair(
+    usage: Counter[str],
+    targets: dict[str, int],
+    candidates: list[str],
+) -> str:
+    # Prefer pairs farthest below target; ties broken by absolute usage.
+    ranked = sorted(
+        candidates,
+        key=lambda p: (
+            usage[p] - targets.get(p, 0),
+            usage[p],
+            p,
+        ),
+    )
+    return ranked[0]
 
 
 
@@ -1083,6 +1125,34 @@ def assign_letters(
     return choices, distractor_type, correct_key
 
 
+def _place_both_option_letter(
+    choices: dict[str, str],
+    distractor_type: dict[str, str],
+    *,
+    correct_key: str,
+    preferred_letter: str | None,
+) -> None:
+    if preferred_letter is None or preferred_letter == correct_key:
+        return
+    current_letter = None
+    for letter, text in choices.items():
+        if text == BOTH_OPTION_TEXT:
+            current_letter = letter
+            break
+    if current_letter is None or current_letter == preferred_letter:
+        return
+    if preferred_letter == correct_key:
+        return
+    choices[current_letter], choices[preferred_letter] = (
+        choices[preferred_letter],
+        choices[current_letter],
+    )
+    distractor_type[current_letter], distractor_type[preferred_letter] = (
+        distractor_type[preferred_letter],
+        distractor_type[current_letter],
+    )
+
+
 
 def _parse_intent(value: str | None) -> IntentDirection | None:
     if value is None:
@@ -1227,6 +1297,8 @@ def generate_example(
     seed: int | None,
     mode: str,
     desired_priority_label: str,
+    desired_conflict_pair: str | None,
+    preferred_both_letter: str | None,
     question_usage: Counter[str],
     context_usage: Counter[str],
     hf_usage: Counter[str],
@@ -1287,6 +1359,7 @@ def generate_example(
                 state,
                 priority_label_usage,
                 desired_priority_label=desired_priority_label,
+                desired_conflict_pair=desired_conflict_pair,
             )
             if relabeled is None:
                 continue
@@ -1363,6 +1436,12 @@ def generate_example(
             pair_assessments=pair_assessments,
         )
         choices, distractor_type, answer = assign_letters(raw_choices, correct_key)
+        _place_both_option_letter(
+            choices,
+            distractor_type,
+            correct_key=correct_key,
+            preferred_letter=preferred_both_letter,
+        )
 
         parts = [scenario_text, "", f"Question: {question}"]
         for key in sorted(choices):
@@ -1438,7 +1517,11 @@ def generate_example(
                         or len(conflicts[priority_vid]) == len(state.vehicles) - 1
                     ),
                     "pair_conflict_count_at_least_2": (
-                        conflict_count >= (4 if resolution == "intersection_no_clear" else 2)
+                        conflict_count >= (
+                            2
+                            if no_clear_subtype == "threeway"
+                            else (4 if resolution == "intersection_no_clear" else 2)
+                        )
                     ),
                     "intent_sensitive_priority_pair": intent_sensitive_with_priority,
                     "direction_only_does_not_match_priority": (
@@ -1467,6 +1550,10 @@ def generate_example(
         ok, _ = validate_example_contract(example)
         if not ok:
             continue
+        if resolution == "unique_priority" and desired_conflict_pair:
+            pair_key = "-".join(example["metadata"]["conflict_pair"])
+            if pair_key != desired_conflict_pair:
+                continue
 
         # Commit balanced-template counters only on accepted example.
         question_usage[question] += 1
@@ -1480,6 +1567,73 @@ def generate_example(
 
     return None
 
+
+
+def _max_answer_run(examples: list[dict]) -> int:
+    prev: str | None = None
+    run = 0
+    best = 0
+    for ex in examples:
+        answer = ex["answer"]
+        if answer == prev:
+            run += 1
+        else:
+            prev = answer
+            run = 1
+        if run > best:
+            best = run
+    return best
+
+
+def _reorder_examples_by_answer_run(examples: list[dict], max_run: int = 4) -> list[dict]:
+    if not examples:
+        return []
+
+    by_letter: dict[str, list[dict]] = {letter: [] for letter in LETTERS}
+    for ex in examples:
+        by_letter[ex["answer"]].append(ex)
+
+    remaining = {letter: len(by_letter[letter]) for letter in LETTERS}
+    ordered: list[dict] = []
+    prev: str | None = None
+    current_run = 0
+
+    def feasible_after_pick(counts: dict[str, int]) -> bool:
+        total = sum(counts.values())
+        if total == 0:
+            return True
+        max_count = max(counts.values())
+        others = total - max_count
+        return max_count <= max_run * (others + 1)
+
+    while len(ordered) < len(examples):
+        candidates: list[str] = []
+        for letter in LETTERS:
+            if remaining[letter] <= 0:
+                continue
+            if letter == prev and current_run >= max_run:
+                continue
+            trial = dict(remaining)
+            trial[letter] -= 1
+            if feasible_after_pick(trial):
+                candidates.append(letter)
+
+        if not candidates:
+            raise RuntimeError(f"could not reorder Task 2 answers with max run <= {max_run}")
+
+        candidates.sort(key=lambda letter: (-remaining[letter], letter == prev, letter))
+        chosen = candidates[0]
+
+        ordered.append(by_letter[chosen].pop(0))
+        remaining[chosen] -= 1
+
+        if chosen == prev:
+            current_run += 1
+        else:
+            prev = chosen
+            current_run = 1
+
+    return ordered
 
 
 def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) -> None:
@@ -1498,10 +1652,21 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
     env_schedule = _build_env_schedule(n)
     mode_schedule = _build_mode_schedule(n, env_schedule)
     priority_schedule = _build_priority_schedule(mode_schedule)
+    n_intersection_priority = sum(1 for m in mode_schedule if m == "intersection_priority")
+    n_roundabout_priority = sum(1 for m in mode_schedule if m == "roundabout_priority")
+    intersection_pair_targets = _build_pair_targets(n_intersection_priority, PAIR_KEYS)
+    # Under current roundabout tie-break semantics, only these two pairs are reachable.
+    roundabout_pair_keys = ["A-B", "A-C"]
+    roundabout_pair_targets = _build_pair_targets(n_roundabout_priority, roundabout_pair_keys)
+    pair_usage_by_env: dict[str, Counter[str]] = {
+        Environment.INTERSECTION.value: Counter(),
+        Environment.ROUNDABOUT.value: Counter(),
+    }
     question_usage: Counter[str] = Counter()
     context_usage: Counter[str] = Counter()
     hf_usage: Counter[str] = Counter()
     priority_label_usage: Counter[str] = Counter()
+    both_option_letter_usage: Counter[str] = Counter()
 
     examples: list[dict] = []
     seen_prompts: set[str] = set()
@@ -1513,19 +1678,61 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                 f"invalid desired priority label at idx={idx}: {desired_priority_label!r}"
             )
         ex = None
-        priority_candidates = [desired_priority_label]
-        if not mode.startswith("intersection_no_clear"):
-            for alt in PRIORITY_LABELS:
-                if alt not in priority_candidates:
-                    priority_candidates.append(alt)
+        if mode == "roundabout_priority":
+            priority_candidates = sorted(
+                PRIORITY_LABELS,
+                key=lambda lbl: (
+                    pair_usage_by_env[Environment.ROUNDABOUT.value][
+                        _roundabout_conflict_pair_from_priority_label(lbl)
+                    ] - roundabout_pair_targets.get(
+                        _roundabout_conflict_pair_from_priority_label(lbl), 0
+                    ),
+                    pair_usage_by_env[Environment.ROUNDABOUT.value][
+                        _roundabout_conflict_pair_from_priority_label(lbl)
+                    ],
+                    lbl != desired_priority_label,
+                    lbl,
+                ),
+            )
+        else:
+            priority_candidates = [desired_priority_label]
+            if not mode.startswith("intersection_no_clear"):
+                for alt in PRIORITY_LABELS:
+                    if alt not in priority_candidates:
+                        priority_candidates.append(alt)
         for _ in range(MAX_RETRIES):
             for wanted_priority in priority_candidates:
+                desired_conflict_pair: str | None = None
+                if mode == "intersection_priority":
+                    compatible_pairs = [
+                        pair for pair in PAIR_KEYS
+                        if wanted_priority in pair.split("-")
+                    ]
+                    desired_conflict_pair = _pick_underused_pair(
+                        pair_usage_by_env[Environment.INTERSECTION.value],
+                        intersection_pair_targets,
+                        compatible_pairs,
+                    )
+                elif mode == "roundabout_priority":
+                    desired_conflict_pair = _roundabout_conflict_pair_from_priority_label(
+                        wanted_priority
+                    )
+                eligible_both_letters = [
+                    letter for letter in LETTERS
+                    if letter != key_schedule[idx]
+                ]
+                preferred_both_letter = min(
+                    eligible_both_letters,
+                    key=lambda letter: (both_option_letter_usage[letter], letter),
+                )
                 candidate = generate_example(
                     idx,
                     key_schedule[idx],
                     seed,
                     mode,
                     wanted_priority,
+                    desired_conflict_pair,
+                    preferred_both_letter,
                     question_usage,
                     context_usage,
                     hf_usage,
@@ -1535,8 +1742,41 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                     continue
                 if candidate["prompt"] in seen_prompts:
                     continue
+                if candidate["metadata"]["resolution"] == "unique_priority":
+                    env_name = candidate["metadata"]["environment"]
+                    pair_list = candidate["metadata"].get("conflict_pair", [])
+                    if isinstance(pair_list, list) and len(pair_list) == 2:
+                        pair_key = "-".join(sorted(pair_list))
+                        if env_name == Environment.INTERSECTION.value:
+                            over_cap = (
+                                pair_usage_by_env[env_name][pair_key]
+                                >= intersection_pair_targets.get(pair_key, 0) + 2
+                            )
+                            if over_cap:
+                                continue
+                        elif env_name == Environment.ROUNDABOUT.value:
+                            target = roundabout_pair_targets.get(pair_key, 0)
+                            over_cap = pair_usage_by_env[env_name][pair_key] >= target + 2
+                            if over_cap:
+                                continue
                 ex = candidate
                 seen_prompts.add(candidate["prompt"])
+                both_letter = next(
+                    (
+                        letter
+                        for letter, text in ex["choices"].items()
+                        if text == BOTH_OPTION_TEXT
+                    ),
+                    None,
+                )
+                if both_letter is not None:
+                    both_option_letter_usage[both_letter] += 1
+                if ex["metadata"]["resolution"] == "unique_priority":
+                    env_name = ex["metadata"]["environment"]
+                    pair_list = ex["metadata"].get("conflict_pair", [])
+                    if isinstance(pair_list, list) and len(pair_list) == 2:
+                        pair_key = "-".join(sorted(pair_list))
+                        pair_usage_by_env[env_name][pair_key] += 1
                 break
             if ex is not None:
                 break
@@ -1547,6 +1787,8 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
                 f"after {MAX_RETRIES} retries"
             )
         examples.append(ex)
+
+    examples = _reorder_examples_by_answer_run(examples, max_run=4)
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1583,6 +1825,7 @@ def generate_task2(n: int, output_path: str, seed: int | None = DEFAULT_SEED) ->
     print("\nAnswer distribution:")
     for letter in LETTERS:
         print(f"  {letter}: {answer_counts[letter]}")
+    print(f"  max_run: {_max_answer_run(examples)}")
 
     env_counts: dict[str, int] = {}
     for ex in examples:

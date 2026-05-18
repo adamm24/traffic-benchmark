@@ -218,7 +218,22 @@ def _safe_apply_action_for_env(
     action: Action,
     env: Environment,
 ) -> str | None:
-    return safe_apply_action(state, vehicle_id, action)
+    before_pos = get_required_vehicle(state, vehicle_id).position
+    event = safe_apply_action(state, vehicle_id, action)
+    if event is None:
+        return None
+    if env != Environment.MULTI_LANE:
+        return event
+    if action not in {Action.CHANGE_LEFT, Action.CHANGE_RIGHT}:
+        return event
+    after_pos = get_required_vehicle(state, vehicle_id).position
+    if after_pos == before_pos:
+        return event
+    try:
+        lane_label = label_of(after_pos)
+    except ValueError:
+        return event
+    return f"Vehicle {vehicle_id} changes to {lane_label}."
 
 
 def _build_multi_lane_scenario(num_vehicles: int = 3) -> ScenarioState:

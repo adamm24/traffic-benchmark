@@ -52,6 +52,7 @@ def write_report(output_root: Path | str, model_order: list[dict[str, str]]) -> 
         "# Pilot Evaluation Report",
         "",
         "Dataset: `dataset/core_simulation/`.",
+        "Note: `dataset/core_simulation/` is the model-facing export generated from `dataset/core/`; it removes generator metadata and inline choice lines while preserving IDs, choices, and gold answers.",
         "Prompting: zero-shot; dataset prompt plus A-E choices plus the fixed instruction.",
         "Gold labels are read only after generation for scoring.",
         "Decoding: deterministic for Hugging Face runs (`do_sample=False`).",
@@ -74,7 +75,7 @@ def write_report(output_root: Path | str, model_order: list[dict[str, str]]) -> 
                 n=summary.get("num_examples", 0) or 0,
                 acc=_display_pct(summary.get("overall_accuracy")),
                 correct=summary.get("overall_correct", ""),
-                limitation=summary.get("limitation", ""),
+                limitation=_table_cell(summary.get("limitation", "")),
             )
         )
 
@@ -216,3 +217,8 @@ def _display_pct(value: Any, *, already_percentage: bool = False) -> str:
     if not already_percentage:
         numeric *= 100
     return f"{numeric:.2f}%"
+
+
+def _table_cell(value: Any) -> str:
+    text = str(value or "")
+    return " ".join(text.split())

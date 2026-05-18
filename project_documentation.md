@@ -669,7 +669,7 @@ Questo richiede due sotto-capacità distinte: applicare le regole di dominio all
 - Scenario iniziale: 3 veicoli con posizioni e direzioni
 - Sequenza: 2–3 eventi
 - Domanda: quale veicolo ha commesso la prima violazione?
-- 5 opzioni con struttura semantica fissa in ogni record: `Vehicle A`, `Vehicle B`, `Vehicle C`, `No vehicle can be determined`, `Another vehicle (not A, B, or C)`
+- 5 opzioni con struttura semantica fissa in ogni record: `Vehicle A`, `Vehicle B`, `Vehicle C`, `No vehicle performed an illegal action`, `Another vehicle (not A, B, or C)`
 
 La quinta opzione ("Another vehicle") è sempre sbagliata per design — testa se il modello confina la risposta agli attori osservabili invece di speculare su veicoli non presenti nello scenario.
 
@@ -719,7 +719,7 @@ Soft fallback per la difficoltà: dopo `SLOT_EARLY_FALLBACK_ATTEMPTS = 180` tent
 | `fixed_option_set` | Le 5 scelte sono esattamente i label semantici attesi |
 | `answer_in_choices` | La lettera di risposta corretta è presente nelle scelte |
 | `correct_vehicle_not_missing_from_choices` | Il label del veicolo violatore appare nelle scelte |
-| `undetermined_correct_only_for_no_violation` | "No vehicle can be determined" è corretto solo per record no_violation |
+| `undetermined_correct_only_for_no_violation` | "No vehicle performed an illegal action" è corretto solo per record no_violation |
 | `violation_step_none_only_for_no_violation` | `violation_step` è None solo per record no_violation |
 | `all_events_valid_format` | Tutti gli eventi hanno i campi richiesti |
 | `first_illegal_event_matches_metadata` | `metadata.violation_step` corrisponde al primo evento illegale del replay |
